@@ -18,9 +18,9 @@ if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
     exit(1)
 
 # ================== НАСТРОЙКИ ==================
-MAX_ARTICLES_PER_RUN = 1
+MAX_ARTICLES_PER_RUN = 5
 MAX_AGE_HOURS = 168          # 7 дней
-SEND_INTERVAL_SEC = 10
+SEND_INTERVAL_SEC = 30
 RSS_TIMEOUT = 10
 PAGE_TIMEOUT = 15
 
