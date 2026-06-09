@@ -1,189 +1,216 @@
-import requests
-import telegram
 import asyncio
 import os
+import html
 import re
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+from telegram import Bot
 from telegram.constants import ParseMode
-from playwright.async_api import async_playwright
+import feedparser
+import requests
+from bs4 import BeautifulSoup
 
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
 
-if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GNEWS_API_KEY]):
-    print("❌ Ошибка: не загружены переменные окружения.")
+if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+    print("❌ Ошибка: не загружены TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID")
     exit(1)
 
-# ================== НАСТРОЙКИ ==================
-MAX_ARTICLES_PER_RUN = 2
-MAX_AGE_HOURS = 72                     # теперь 3 дня
+# ------------------- НАСТРОЙКИ -------------------
+MAX_ARTICLES_PER_RUN = 2      # максимум новостей за один запуск
+MAX_AGE_HOURS = 72            # не старше 3 дней
 SEND_INTERVAL_SEC = 20
 
-# Белый список – достаточно одного слова
+# Список RSS-лент (футбольные новости)
+RSS_FEEDS = [
+    "http://www.rusfootball.info/rss.xml",
+    "http://www.euro-football.ru/news/news_xml_redtram.php3",
+    "http://www.gazeta.ru/export/rss/sportnews.xml",
+    "http://fanat1k.ru/e107_plugins/rss_menu/rss.php?news.2",
+    "https://news.sportbox.ru/taxonomy/term/12216/0/feed"
+]
+
+# Ключевые слова для фильтра (футбол)
 FOOTBALL_KEYWORDS = [
     "футбол", "soccer", "football", "чемпионат", "лига чемпионов",
     "евро", "кубок", "гол", "матч", "тренер", "игрок", "стадион",
     "рфпл", "премьер-лига", "ла лига", "серия а", "бундеслига"
 ]
-# Чёрный список временно отключён (просто закомментирован)
-# BLACKLIST_WORDS = [...]
-BLACKLIST_WORDS = []   # пустой список = ничего не блокируем
+
+# Чёрный список (нежелательные темы)
+BLACKLIST_WORDS = [
+    "американский футбол", "nfl", "super bowl", "тревис келси", "travis kelce",
+    "тейлор свифт", "taylor swift", "свадьба", "баскетбол", "нба", "теннис"
+]
 
 def is_football_article(title: str, description: str) -> bool:
+    """Проверяет, относится ли новость к футболу"""
     text = (title + " " + (description or "")).lower()
-    # Проверка чёрного списка
     for bad in BLACKLIST_WORDS:
         if bad in text:
             return False
-    # Проверка белого списка
     for good in FOOTBALL_KEYWORDS:
         if good in text:
             return True
     return False
 
-def is_recent(published_at: str) -> bool:
-    if not published_at:
-        print("    ⚠️ Нет поля publishedAt")
-        return False
+def parse_rss_date(date_str: str):
+    """Пытается преобразовать дату из RSS в datetime (UTC)"""
+    if not date_str:
+        return None
+    # feedparser уже отдаёт структурированную дату, но на всякий случай
     try:
-        if published_at.endswith('Z'):
-            published_at = published_at[:-1] + '+00:00'
-        pub_dt = datetime.fromisoformat(published_at)
-        now = datetime.now(timezone.utc)
-        age = now - pub_dt
-        result = age.total_seconds() <= MAX_AGE_HOURS * 3600
-        if not result:
-            print(f"    📅 Слишком старая: {pub_dt} (возраст {age.days} дней)")
-        return result
-    except Exception as e:
-        print(f"    ❌ Ошибка парсинга даты: {e}")
-        return False
+        # Попробуем стандартные форматы
+        dt = feedparser._parse_date(date_str)
+        if dt:
+            return dt
+    except:
+        pass
+    return None
 
-def fetch_gnews():
-    print("📡 Запрос к GNews API...")
-    # Для русских новостей лучше использовать "sport football" или просто "футбол"
-    query = "футбол"
-    url = f"https://gnews.io/api/v4/search?q={query}&lang=ru&country=ru&max=15&apikey={GNEWS_API_KEY}"
-    try:
-        resp = requests.get(url, timeout=15)
-        if resp.status_code != 200:
-            print(f"⚠️ GNews вернул код {resp.status_code}")
-            return []
-        data = resp.json()
-        articles = data.get("articles", [])
-        print(f"✅ Получено {len(articles)} статей")
-        # Отладка: выведем первые 3 заголовка
-        for i, art in enumerate(articles[:3]):
-            print(f"   {i+1}. {art.get('title')} ({art.get('publishedAt')})")
-        return articles
-    except Exception as e:
-        print(f"❌ Ошибка при запросе к GNews: {e}")
-        return []
+def is_recent(published_struct) -> bool:
+    """Проверяет, не старше ли новость MAX_AGE_HOURS"""
+    if not published_struct:
+        return False
+    # published_struct может быть кортежем time.struct_time или datetime
+    if hasattr(published_struct, 'tm_year'):
+        pub_dt = datetime(*published_struct[:6], tzinfo=timezone.utc)
+    elif isinstance(published_struct, datetime):
+        pub_dt = published_struct
+    else:
+        return False
+    now = datetime.now(timezone.utc)
+    age = now - pub_dt
+    return age.total_seconds() <= MAX_AGE_HOURS * 3600
+
+def fetch_rss_news():
+    """Собирает новости из всех RSS-лент, фильтрует по свежести и теме"""
+    all_news = []
+    for feed_url in RSS_FEEDS:
+        print(f"📡 Парсим RSS: {feed_url}")
+        try:
+            feed = feedparser.parse(feed_url)
+            if feed.bozo:  # ошибка парсинга
+                print(f"   ⚠️ Ошибка парсинга: {feed.bozo_exception}")
+            for entry in feed.entries[:10]:  # не больше 10 с каждой ленты
+                title = entry.get('title', '')
+                link = entry.get('link', '')
+                # Берём описание (может быть кратким)
+                description = entry.get('summary', entry.get('description', ''))
+                # Очищаем HTML из описания
+                if description:
+                    soup = BeautifulSoup(description, 'html.parser')
+                    description = soup.get_text(separator=' ', strip=True)
+                published = entry.get('published_parsed')
+                if not title or not link:
+                    continue
+                if not is_recent(published):
+                    continue
+                if not is_football_article(title, description):
+                    continue
+                all_news.append({
+                    'title': title,
+                    'url': link,
+                    'description': description,
+                    'published': published,
+                })
+        except Exception as e:
+            print(f"   ❌ Ошибка при загрузке {feed_url}: {e}")
+    # Убираем дубликаты по URL
+    unique = {}
+    for item in all_news:
+        if item['url'] not in unique:
+            unique[item['url']] = item
+    return list(unique.values())
 
 async def get_full_text(url: str) -> str:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        full_text = ""
-        try:
-            await page.goto(url, timeout=45000, wait_until="domcontentloaded")
-            selectors = ['article', '.article-content', '.post-content', '.entry-content', '.content', '#main-content', '.news-detail']
-            for sel in selectors:
-                container = await page.query_selector(sel)
-                if container:
-                    paragraphs = await container.query_selector_all('p')
-                    texts = [await p.inner_text() for p in paragraphs[:6] if len(await p.inner_text()) > 40]
-                    if texts:
-                        full_text = "\n\n".join(texts)
-                        break
-            if not full_text:
-                all_paragraphs = await page.query_selector_all('p')
-                for p in all_paragraphs[:6]:
-                    txt = await p.inner_text()
-                    if len(txt) > 40:
-                        full_text += txt.strip() + "\n\n"
-        except Exception as e:
-            print(f"⚠️ Ошибка парсинга {url}: {e}")
-        finally:
-            await browser.close()
-        return full_text.strip()
+    """Пытается получить полный текст статьи со страницы (если description слишком короткий)"""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        resp = requests.get(url, timeout=15, headers=headers)
+        if resp.status_code != 200:
+            return ''
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        # Ищем основной контент
+        for selector in ['article', '.article-content', '.post-content', '.entry-content', '.content', '#main-content']:
+            container = soup.select_one(selector)
+            if container:
+                paragraphs = container.find_all('p')
+                text = '\n\n'.join(p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 40)
+                if len(text) > 200:
+                    return text
+        # fallback: все параграфы
+        all_paras = soup.find_all('p')
+        text = '\n\n'.join(p.get_text(strip=True) for p in all_paras if len(p.get_text(strip=True)) > 60)
+        return text[:3000]  # ограничим
+    except Exception as e:
+        print(f"⚠️ Ошибка парсинга {url}: {e}")
+        return ''
 
-async def send_article(bot, article):
-    title = article.get("title")
-    url = article.get("url")
-    image = article.get("image")
-    description = article.get("description", "")
+async def send_article(bot: Bot, article: dict):
+    title = article['title']
+    url = article['url']
+    description = article.get('description', '')
 
-    if not title or not url:
-        return False
+    # Если описание слишком короткое (< 300 символов), пытаемся распарсить страницу
+    full_text = description
+    if len(full_text) < 300:
+        print(f"📰 Описание короткое, парсим страницу: {title[:60]}...")
+        page_text = await get_full_text(url)
+        if page_text:
+            full_text = page_text
+        else:
+            full_text = description
 
-    if not is_football_article(title, description):
-        print(f"⏭️ Пропускаем (не футбол по ключевым словам): {title[:60]}")
-        return False
+    # Экранируем HTML-символы
+    safe_title = html.escape(title)
+    safe_text = html.escape(full_text)
 
-    print(f"📰 Парсим полный текст: {title[:60]}...")
-    full_text = await get_full_text(url)
-    if not full_text:
-        full_text = description
+    # Формируем сообщение: только заголовок (жирный) и текст. БЕЗ ссылки на источник.
+    message = f"⚽ <b>{safe_title}</b>\n\n{safe_text}"
 
-    caption_parts = [
-        f"⚽ <b>{title}</b>\n",
-        full_text[:900],
-        "",
-        f"🔗 <a href='{url}'>Читать полностью на сайте</a>"
-    ]
-    caption = "\n".join(p for p in caption_parts if p)
-    if len(caption) > 1024:
-        caption = caption[:1020] + "..."
+    if len(message) > 4096:
+        message = message[:4093] + "..."
 
     try:
-        if image:
-            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=image, caption=caption, parse_mode=ParseMode.HTML)
-        else:
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=message,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
         print(f"✅ Отправлено: {title[:60]}...")
         return True
     except Exception as e:
         print(f"❌ Ошибка отправки: {e}")
-        return False
+        # Пробуем без HTML
+        try:
+            plain_message = re.sub(r'<[^>]+>', '', message)
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=plain_message, disable_web_page_preview=True)
+            print("   ✅ Отправлено в plain-режиме")
+            return True
+        except Exception as e2:
+            print(f"   ❌ Не удалось: {e2}")
+            return False
 
 async def main():
-    print("🚀 Запуск футбольного бота (полный текст, без дат и контактов)")
-    bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+    print("🚀 Запуск RSS-футбольного бота (полный текст, без ссылок и дат)")
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-    articles = fetch_gnews()
-    if not articles:
-        print("Нет новостей от GNews.")
+    news = fetch_rss_news()
+    if not news:
+        print("Нет свежих футбольных новостей.")
         return
 
-    fresh_football = []
-    seen_urls = set()
-    for art in articles:
-        url = art.get("url")
-        pub = art.get("publishedAt")
-        title = art.get("title", "")
-        desc = art.get("description", "")
-        if not url or url in seen_urls:
-            continue
-        if not is_recent(pub):
-            continue
-        if not is_football_article(title, desc):
-            continue
-        seen_urls.add(url)
-        fresh_football.append(art)
+    # Сортируем по дате (новые сверху) если есть published
+    news.sort(key=lambda x: x.get('published'), reverse=True)
 
-    if not fresh_football:
-        print("Нет свежих футбольных новостей за последние", MAX_AGE_HOURS, "часов.")
-        return
-
-    print(f"Найдено {len(fresh_football)} подходящих новостей. Отправлю не более {MAX_ARTICLES_PER_RUN}.")
+    print(f"Найдено {len(news)} новостей. Отправлю не более {MAX_ARTICLES_PER_RUN}.")
     sent = 0
-    for art in fresh_football[:MAX_ARTICLES_PER_RUN]:
-        success = await send_article(bot, art)
-        if success:
+    for item in news[:MAX_ARTICLES_PER_RUN]:
+        if await send_article(bot, item):
             sent += 1
             if sent < MAX_ARTICLES_PER_RUN:
                 await asyncio.sleep(SEND_INTERVAL_SEC)
