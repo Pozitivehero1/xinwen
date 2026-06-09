@@ -19,34 +19,32 @@ if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GNEWS_API_KEY]):
     exit(1)
 
 # ================== НАСТРОЙКИ ==================
-MAX_ARTICLES_PER_RUN = 3          # Сколько новостей отправлять за один запуск
-MAX_AGE_HOURS = 24                # Не отправлять новости старше X часов
-SEND_INTERVAL_SEC = 20            # Пауза между отправками
-CHANNEL_HEADER = "⚽ Футбольные новости"
-CONTACT_TEXT = "📩 Связаться"
-CONTACT_URL = "https://t.me/tl33054"
-GROUP_TEXT = "💬 Обсудить"
-GROUP_URL = "https://t.me/DONG8NY"
+MAX_ARTICLES_PER_RUN = 2          # не больше 2 новостей за раз (чтобы не превысить лимит Playwright)
+MAX_AGE_HOURS = 24
+SEND_INTERVAL_SEC = 20
 
-# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
-def format_time(time_str: str) -> str:
-    """Приводит ISO-время к читаемому формату (МСК = UTC+3)."""
-    if not time_str:
-        return "неизвестно"
-    try:
-        # Убираем 'Z' и добавляем +00:00
-        if time_str.endswith('Z'):
-            time_str = time_str[:-1] + '+00:00'
-        dt = datetime.fromisoformat(time_str)
-        # Переводим в Московское время (UTC+3)
-        msk_tz = timezone(timedelta(hours=3))
-        dt_msk = dt.astimezone(msk_tz)
-        return dt_msk.strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        return time_str.split('T')[0]
+# Ключевые слова для фильтра (только настоящий футбол)
+FOOTBALL_KEYWORDS = [
+    "футбол", "soccer", "football", "чемпионат", "лига чемпионов",
+    "евро", "кубок", "гол", "матч", "тренер", "игрок", "стадион"
+]
+BLACKLIST_WORDS = [
+    "американский футбол", "nfl", "super bowl", "тревис келси", "travis kelce",
+    "тейлор свифт", "taylor swift", "нба", "nba", "баскетбол", "теннис",
+    "хоккей", "формула", "биатлон", "свадьба", "певица"
+]
+
+def is_football_article(title: str, description: str) -> bool:
+    text = (title + " " + (description or "")).lower()
+    for bad in BLACKLIST_WORDS:
+        if bad in text:
+            return False
+    for good in FOOTBALL_KEYWORDS:
+        if good in text:
+            return True
+    return False
 
 def is_recent(published_at: str) -> bool:
-    """Проверяет, что новость не старше MAX_AGE_HOURS."""
     if not published_at:
         return False
     try:
@@ -59,24 +57,10 @@ def is_recent(published_at: str) -> bool:
     except Exception:
         return False
 
-def extract_hashtags(title: str) -> str:
-    """Примитивное выделение ключевых слов для хэштегов (без jieba)."""
-    words = re.findall(r'\b\w{4,}\b', title.lower())
-    # Убираем стоп-слова
-    stop = {'это', 'все', 'после', 'перед', 'который', 'также', 'еще', 'уже'}
-    tags = [w for w in words if w not in stop][:3]
-    return " ".join(f"#{tag}" for tag in tags) if tags else "#футбол"
-
-# ================== ПОЛУЧЕНИЕ НОВОСТЕЙ ИЗ GNews ==================
 def fetch_gnews():
-    """Запрашивает свежие футбольные новости на русском языке."""
     print("📡 Запрос к GNews API...")
-    # Ключевые слова: футбол, возможны варианты
-    query = "(football OR soccer OR футбол)"
-    url = (
-        f"https://gnews.io/api/v4/search?q={query}"
-        f"&lang=ru&country=ru&max=10&apikey={GNEWS_API_KEY}"
-    )
+    query = "футбол"
+    url = f"https://gnews.io/api/v4/search?q={query}&lang=ru&country=ru&max=10&apikey={GNEWS_API_KEY}"
     try:
         resp = requests.get(url, timeout=15)
         if resp.status_code != 200:
@@ -90,93 +74,73 @@ def fetch_gnews():
         print(f"❌ Ошибка при запросе к GNews: {e}")
         return []
 
-# ================== ПАРСИНГ ПОЛНОЙ СТАТЬИ (ПЕРВЫЕ АБЗАЦЫ) ==================
-async def scrape_details(url: str):
-    """Возвращает (полное время публикации, краткое содержание) со страницы новости."""
-    pub_time = ""
-    summary = ""
+async def get_full_text(url: str) -> str:
+    """Парсит страницу новости и возвращает первые абзацы текста."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
+        full_text = ""
         try:
             await page.goto(url, timeout=45000, wait_until="domcontentloaded")
-            # Пытаемся найти время публикации
-            time_selectors = [
-                'meta[property="article:published_time"]',
-                'meta[name="publish-date"]',
-                'time',
-                '.publish-date',
-                '.date'
+            # Ищем контейнер с текстом статьи
+            selectors = [
+                'article', '.article-content', '.post-content',
+                '.entry-content', '.content', '#main-content',
+                '.news-detail', '.story__content'
             ]
-            for sel in time_selectors:
-                el = await page.query_selector(sel)
-                if el:
-                    attr = await el.get_attribute("content") or await el.get_attribute("datetime")
-                    if attr:
-                        pub_time = attr.strip()
-                        break
-                    txt = await el.inner_text()
-                    if txt:
-                        pub_time = txt.strip()
-                        break
-            # Берём первые 2 абзаца из тела статьи
-            content_selectors = [
-                'article', '.article-body', '.post-content',
-                '.entry-content', '.content', '#main-content'
-            ]
-            for sel in content_selectors:
+            for sel in selectors:
                 container = await page.query_selector(sel)
                 if container:
                     paragraphs = await container.query_selector_all('p')
                     texts = []
-                    for p in paragraphs[:3]:
+                    for p in paragraphs[:6]:  # берём до 6 абзацев
                         txt = await p.inner_text()
                         if txt and len(txt) > 40:
                             texts.append(txt.strip())
                     if texts:
-                        summary = "\n\n".join(texts[:2])
+                        full_text = "\n\n".join(texts)
                         break
+            if not full_text:
+                # запасной вариант: все параграфы на странице
+                all_paragraphs = await page.query_selector_all('p')
+                for p in all_paragraphs[:6]:
+                    txt = await p.inner_text()
+                    if txt and len(txt) > 40:
+                        full_text += txt.strip() + "\n\n"
         except Exception as e:
-            print(f"⚠️ Ошибка при парсинге {url}: {e}")
+            print(f"⚠️ Ошибка парсинга {url}: {e}")
         finally:
             await browser.close()
-    return pub_time, summary
+    return full_text.strip()
 
-# ================== ОТПРАВКА В TELEGRAM ==================
-async def send_article(bot, article, custom_summary=""):
-    """Формирует и отправляет один пост в канал."""
+async def send_article(bot, article):
     title = article.get("title")
     url = article.get("url")
     image = article.get("image")
-    source = article.get("source", {}).get("name", "источник")
-    published = article.get("publishedAt")
     description = article.get("description", "")
 
     if not title or not url:
         return False
 
-    # Если не удалось распарсить summary, используем description из API
-    final_summary = custom_summary if custom_summary else description
-    if not final_summary:
-        final_summary = "👉 Нажмите «читать далее», чтобы открыть полную новость."
+    # Фильтр по теме
+    if not is_football_article(title, description):
+        print(f"⏭️ Пропускаем (не футбол): {title[:60]}")
+        return False
 
-    # Время публикации
-    time_str = format_time(published)
-    hashtags = extract_hashtags(title)
+    print(f"📰 Парсим полный текст: {title[:60]}...")
+    full_text = await get_full_text(url)
+    if not full_text:
+        full_text = description  # если не спарсили, используем описание из API
 
-    # Построение текста
+    # Убираем дату и источник – теперь только заголовок, текст и ссылка
     caption_parts = [
-        f"{CHANNEL_HEADER} {hashtags}\n",
-        f"<b>{title}</b>\n",
-        final_summary[:800],  # ограничим, чтобы не превысить лимит Telegram
+        f"⚽ <b>{title}</b>\n",
+        full_text[:900],          # ограничим, чтобы не превысить лимит Telegram
         "",
-        f"📅 {time_str} | 📰 {source}",
-        f"🔗 <a href='{url}'>Читать полностью</a>",
-        f"{CONTACT_TEXT}: <a href='{CONTACT_URL}'>{CONTACT_TEXT}</a> | {GROUP_TEXT}: <a href='{GROUP_URL}'>{GROUP_TEXT}</a>"
+        f"🔗 <a href='{url}'>Читать полностью на сайте</a>"
     ]
     caption = "\n".join(p for p in caption_parts if p)
 
-    # Обрезаем, если больше 1024 символов (лимит caption)
     if len(caption) > 1024:
         caption = caption[:1020] + "..."
 
@@ -199,57 +163,41 @@ async def send_article(bot, article, custom_summary=""):
         return True
     except Exception as e:
         print(f"❌ Ошибка отправки: {e}")
-        # Пробуем без картинки и HTML
-        try:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=caption,
-                disable_web_page_preview=True
-            )
-            return True
-        except Exception as e2:
-            print(f"❌ И резервная отправка провалилась: {e2}")
-            return False
+        return False
 
-# ================== ГЛАВНАЯ ФУНКЦИЯ (ОДИН ЗАПУСК ДЛЯ GITHUB ACTIONS) ==================
 async def main():
-    print("🚀 Запуск футбольного новостного бота (serverless mode)")
+    print("🚀 Запуск футбольного бота (полный текст, без дат и контактов)")
     bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 
-    # Получаем свежие новости
     articles = fetch_gnews()
     if not articles:
         print("Нет новостей от GNews.")
         return
 
-    # Фильтруем: только недавние и уникальные в пределах этого запуска
-    recent_articles = []
+    # Фильтруем свежие и по теме
+    fresh_football = []
     seen_urls = set()
     for art in articles:
         url = art.get("url")
         pub = art.get("publishedAt")
-        if url and url not in seen_urls and is_recent(pub):
+        title = art.get("title", "")
+        desc = art.get("description", "")
+        if url and url not in seen_urls and is_recent(pub) and is_football_article(title, desc):
             seen_urls.add(url)
-            recent_articles.append(art)
+            fresh_football.append(art)
 
-    if not recent_articles:
-        print("Нет свежих новостей (старше 24 часов или дубликаты).")
+    if not fresh_football:
+        print("Нет свежих футбольных новостей за последние 24 часа.")
         return
 
-    print(f"Найдено {len(recent_articles)} свежих новостей. Отправлю не более {MAX_ARTICLES_PER_RUN}.")
+    print(f"Найдено {len(fresh_football)} подходящих новостей. Отправлю не более {MAX_ARTICLES_PER_RUN}.")
     sent = 0
-    for art in recent_articles[:MAX_ARTICLES_PER_RUN]:
-        # Пытаемся получить расширенное описание со страницы (не обязательно)
-        pub_time, detail_summary = await scrape_details(art["url"])
-        # Если удалось достать текст – используем его, иначе description
-        final_text = detail_summary if detail_summary else art.get("description", "")
-        success = await send_article(bot, art, final_text)
+    for art in fresh_football[:MAX_ARTICLES_PER_RUN]:
+        success = await send_article(bot, art)
         if success:
             sent += 1
             if sent < MAX_ARTICLES_PER_RUN:
                 await asyncio.sleep(SEND_INTERVAL_SEC)
-        else:
-            print(f"⚠️ Пропущена новость: {art['title'][:50]}")
 
     print(f"✨ Завершено. Отправлено {sent} новостей.")
 
