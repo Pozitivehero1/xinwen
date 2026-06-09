@@ -19,8 +19,8 @@ if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, MISTRAL_API_KEY]):
     print("❌ Ошибка: не хватает переменных окружения")
     exit(1)
 
-MAX_ARTICLES_PER_RUN = 1
-MAX_AGE_HOURS = 72
+MAX_ARTICLES_PER_RUN = 1          # 1 новость за запуск
+MAX_AGE_HOURS = 72                # не старше 3 дней
 RSS_TIMEOUT = 12
 PAGE_TIMEOUT = 12
 MISTRAL_MODEL = "mistral-tiny"
@@ -122,9 +122,8 @@ def fetch_page_image_and_text(url: str):
             return None, None
         html_content = resp.text
         
-        # Поиск картинки: og:image или первая подходящая
+        # Поиск картинки: og:image или первая <img>
         image = None
-        # og:image
         og_match = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html_content)
         if not og_match:
             og_match = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', html_content)
@@ -132,19 +131,17 @@ def fetch_page_image_and_text(url: str):
             image = og_match.group(1)
             if image.startswith('/'):
                 image = urljoin(url, image)
-        # Если нет og:image, ищем первый <img> с шириной > 200 (приблизительно)
         if not image:
             img_tags = re.findall(r'<img[^>]+src=["\']([^"\']+)["\'][^>]*>', html_content)
             for img_url in img_tags:
                 if any(ext in img_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
                     if not img_url.startswith('http'):
                         img_url = urljoin(url, img_url)
-                    # Пропускаем маленькие иконки
                     if 'logo' not in img_url.lower() and 'icon' not in img_url.lower():
                         image = img_url
                         break
         
-        # Извлечение текста: очищаем от скриптов, стилей, берём параграфы
+        # Извлечение текста
         clean = re.sub(r'<script.*?</script>', '', html_content, flags=re.DOTALL)
         clean = re.sub(r'<style.*?</style>', '', clean, flags=re.DOTALL)
         paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', clean, re.DOTALL)
@@ -168,10 +165,18 @@ def fetch_page_image_and_text(url: str):
         print(f"   Ошибка загрузки страницы {url}: {e}")
         return None, None
 
+def is_valid_image_url(url: str) -> bool:
+    """Проверяет, что URL ведёт на изображение (через HEAD-запрос)"""
+    try:
+        resp = requests.head(url, timeout=5, allow_redirects=True)
+        content_type = resp.headers.get('content-type', '')
+        return content_type.startswith('image/')
+    except:
+        return False
+
 def summarize_with_mistral(text: str) -> str:
     if not text or len(text) < 50:
         return text
-    # Жёсткий промпт без шаблонов
     prompt = f"""Перескажи футбольную новость коротко (3-5 предложений), только факты: кто, что, где, когда, какой счёт (если есть). Не используй фразы "если известно", "уточнить", "ключевые моменты" и не пиши шаблонные заглушки. Просто напиши связный текст.
 
 Новость:
@@ -194,7 +199,6 @@ def summarize_with_mistral(text: str) -> str:
         if resp.status_code == 200:
             data = resp.json()
             summary = data["choices"][0]["message"]["content"].strip()
-            # Проверка на мусорные фразы
             if any(bad in summary for bad in ["если известен", "уточнить", "X:X", "ключевые моменты"]):
                 print("   Пересказ содержит шаблонный мусор, используем оригинальный текст")
                 return text[:800]
@@ -202,11 +206,22 @@ def summarize_with_mistral(text: str) -> str:
                 summary = summary[:800] + "..."
             return summary
         else:
-            print(f"Mistral ошибка {resp.status_code}: {resp.text[:200]}")
+            print(f"Mistral ошибка {resp.status_code}")
             return text
     except Exception as e:
         print(f"Mistral исключение: {e}")
         return text
+
+def load_sent_urls():
+    if not os.path.exists('sent_urls.txt'):
+        return set()
+    with open('sent_urls.txt', 'r', encoding='utf-8') as f:
+        return set(line.strip() for line in f if line.strip())
+
+def save_sent_urls(urls_set):
+    with open('sent_urls.txt', 'w', encoding='utf-8') as f:
+        for url in urls_set:
+            f.write(url + '\n')
 
 async def send_article(bot, title, url, description, rss_image):
     print(f"📰 Загружаем страницу: {title[:50]}...")
@@ -214,28 +229,26 @@ async def send_article(bot, title, url, description, rss_image):
     if not full_text:
         full_text = description if description else ""
     
-    # Выбираем картинку: сначала со страницы, потом из RSS
+    # Выбираем картинку, если она валидна
     image = None
-    if page_image and page_image.startswith(('http://', 'https://')):
-        image = page_image
-    elif rss_image and rss_image.startswith(('http://', 'https://')):
-        image = rss_image
-    
-    if image:
-        print(f"   Используем картинку: {image[:80]}")
+    candidate = page_image or rss_image
+    if candidate and candidate.startswith(('http://', 'https://')):
+        if await asyncio.to_thread(is_valid_image_url, candidate):
+            image = candidate
+            print(f"   Картинка валидна: {image[:80]}")
+        else:
+            print(f"   Картинка невалидна (MIME-тип), отправляем без фото")
     else:
-        print("   Картинка отсутствует, отправляем только текст")
+        print("   Нет подходящей картинки")
     
     if not full_text:
         print("   Нет текста новости")
         return False
     
-    # Пересказ от Mistral
     summary = await asyncio.to_thread(summarize_with_mistral, full_text)
     safe_title = html.escape(title)
     caption = f"⚽ <b>{safe_title}</b>\n\n{summary}"
     if len(caption) > 1024:
-        # Обрезаем пересказ, оставляя заголовок
         max_summary_len = 1024 - len(f"⚽ <b>{safe_title}</b>\n\n") - 3
         summary = summary[:max_summary_len] + "..."
         caption = f"⚽ <b>{safe_title}</b>\n\n{summary}"
@@ -249,20 +262,23 @@ async def send_article(bot, title, url, description, rss_image):
         return True
     except Exception as e:
         print(f"❌ Ошибка отправки: {e}")
-        # Пробуем отправить без фото
-        if "Wrong type" in str(e) or "Failed to get http url content" in str(e):
-            print("   Пробуем отправить без фото")
+        # Пробуем без фото (если не пробовали)
+        if image:
+            print("   Пробуем отправить текстом")
             try:
                 await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
-                print("   ✅ Отправлено текстом")
                 return True
             except Exception as e2:
-                print(f"   ❌ Не удалось и текстом: {e2}")
+                print(f"   ❌ Не удалось: {e2}")
         return False
 
 async def main():
-    print("🚀 Запуск футбольного бота с Mistral (исправленный промпт)")
+    print("🚀 Запуск футбольного бота (проверка картинок, сохранение URL)")
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    
+    sent_urls = load_sent_urls()
+    print(f"Загружено {len(sent_urls)} ранее отправленных URL")
+    
     all_news = []
     for feed_url in RSS_FEEDS:
         print(f"📡 RSS: {feed_url}")
@@ -271,22 +287,26 @@ async def main():
         for title, link, desc, pub_date, rss_image in items:
             if not title or not link:
                 continue
+            if link in sent_urls:
+                continue
             if not is_football_article(title, desc):
                 continue
             if not is_recent(pub_date):
                 continue
             all_news.append((title, link, desc, rss_image, pub_date))
     if not all_news:
-        print("Нет свежих футбольных новостей.")
+        print("Нет новых футбольных новостей.")
         return
+    # Сортируем по дате (новые сверху)
     all_news.sort(key=lambda x: parse_rss_date(x[4]) or datetime.min, reverse=True)
     to_send = all_news[:MAX_ARTICLES_PER_RUN]
     print(f"Отправляю {len(to_send)} новостей...")
-    for idx, (title, link, desc, rss_image, _) in enumerate(to_send):
-        ok = await send_article(bot, title, link, desc, rss_image)
-        if ok and idx < len(to_send)-1:
-            await asyncio.sleep(10)
-    print("✨ Готово.")
+    for title, link, desc, rss_image, _ in to_send:
+        success = await send_article(bot, title, link, desc, rss_image)
+        if success:
+            sent_urls.add(link)
+    save_sent_urls(sent_urls)
+    print(f"✨ Готово. Отправлено {len(to_send)}. Всего сохранено URL: {len(sent_urls)}")
 
 if __name__ == "__main__":
     asyncio.run(main())
