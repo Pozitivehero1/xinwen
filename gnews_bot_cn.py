@@ -23,7 +23,7 @@ MAX_ARTICLES_PER_RUN = 1
 MAX_AGE_HOURS = 72
 RSS_TIMEOUT = 12
 PAGE_TIMEOUT = 12
-MISTRAL_MODEL = "mistral-tiny"   # бесплатно, либо "mistral-small"
+MISTRAL_MODEL = "mistral-tiny"
 
 RSS_FEEDS = [
     "http://www.rusfootball.info/rss.xml",
@@ -121,16 +121,30 @@ def fetch_page_image_and_text(url: str):
             print(f"   Страница ответила кодом {resp.status_code}")
             return None, None
         html_content = resp.text
-        # og:image
+        
+        # Поиск картинки: og:image или первая подходящая
         image = None
-        match = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html_content)
-        if not match:
-            match = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', html_content)
-        if match:
-            image = match.group(1)
+        # og:image
+        og_match = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html_content)
+        if not og_match:
+            og_match = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', html_content)
+        if og_match:
+            image = og_match.group(1)
             if image.startswith('/'):
                 image = urljoin(url, image)
-        # извлечение текста
+        # Если нет og:image, ищем первый <img> с шириной > 200 (приблизительно)
+        if not image:
+            img_tags = re.findall(r'<img[^>]+src=["\']([^"\']+)["\'][^>]*>', html_content)
+            for img_url in img_tags:
+                if any(ext in img_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                    if not img_url.startswith('http'):
+                        img_url = urljoin(url, img_url)
+                    # Пропускаем маленькие иконки
+                    if 'logo' not in img_url.lower() and 'icon' not in img_url.lower():
+                        image = img_url
+                        break
+        
+        # Извлечение текста: очищаем от скриптов, стилей, берём параграфы
         clean = re.sub(r'<script.*?</script>', '', html_content, flags=re.DOTALL)
         clean = re.sub(r'<style.*?</style>', '', clean, flags=re.DOTALL)
         paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', clean, re.DOTALL)
@@ -154,11 +168,13 @@ def fetch_page_image_and_text(url: str):
         print(f"   Ошибка загрузки страницы {url}: {e}")
         return None, None
 
-def summarize_with_mistral(text: str, max_tokens: int = 400) -> str:
+def summarize_with_mistral(text: str) -> str:
     if not text or len(text) < 50:
         return text
-    prompt = f"""Ты спортивный журналист. Перескажи эту футбольную новость кратко, но содержательно, примерно 300-500 символов. Выдели главные события, имена, счёт, интригу. Не добавляй рекламу, не упоминай сайт. Новость:
+    # Жёсткий промпт без шаблонов
+    prompt = f"""Перескажи футбольную новость коротко (3-5 предложений), только факты: кто, что, где, когда, какой счёт (если есть). Не используй фразы "если известно", "уточнить", "ключевые моменты" и не пиши шаблонные заглушки. Просто напиши связный текст.
 
+Новость:
 {text[:2000]}"""
     try:
         resp = requests.post(
@@ -170,14 +186,18 @@ def summarize_with_mistral(text: str, max_tokens: int = 400) -> str:
             json={
                 "model": MISTRAL_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.4,
-                "max_tokens": max_tokens
+                "temperature": 0.3,
+                "max_tokens": 350
             },
             timeout=20
         )
         if resp.status_code == 200:
             data = resp.json()
             summary = data["choices"][0]["message"]["content"].strip()
+            # Проверка на мусорные фразы
+            if any(bad in summary for bad in ["если известен", "уточнить", "X:X", "ключевые моменты"]):
+                print("   Пересказ содержит шаблонный мусор, используем оригинальный текст")
+                return text[:800]
             if len(summary) > 800:
                 summary = summary[:800] + "..."
             return summary
@@ -193,28 +213,33 @@ async def send_article(bot, title, url, description, rss_image):
     page_image, full_text = await asyncio.to_thread(fetch_page_image_and_text, url)
     if not full_text:
         full_text = description if description else ""
-    # Выбираем картинку: сначала со страницы, потом из RSS, только если валидный http
+    
+    # Выбираем картинку: сначала со страницы, потом из RSS
     image = None
     if page_image and page_image.startswith(('http://', 'https://')):
         image = page_image
     elif rss_image and rss_image.startswith(('http://', 'https://')):
         image = rss_image
+    
     if image:
         print(f"   Используем картинку: {image[:80]}")
     else:
-        print("   Картинка отсутствует, будем отправлять только текст")
+        print("   Картинка отсутствует, отправляем только текст")
+    
     if not full_text:
         print("   Нет текста новости")
         return False
-    # Пересказ через Mistral
-    summary = await asyncio.to_thread(summarize_with_mistral, full_text, 400)
+    
+    # Пересказ от Mistral
+    summary = await asyncio.to_thread(summarize_with_mistral, full_text)
     safe_title = html.escape(title)
     caption = f"⚽ <b>{safe_title}</b>\n\n{summary}"
     if len(caption) > 1024:
-        # Обрезаем пересказ
+        # Обрезаем пересказ, оставляя заголовок
         max_summary_len = 1024 - len(f"⚽ <b>{safe_title}</b>\n\n") - 3
         summary = summary[:max_summary_len] + "..."
         caption = f"⚽ <b>{safe_title}</b>\n\n{summary}"
+    
     try:
         if image:
             await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=image, caption=caption, parse_mode=ParseMode.HTML)
@@ -224,7 +249,7 @@ async def send_article(bot, title, url, description, rss_image):
         return True
     except Exception as e:
         print(f"❌ Ошибка отправки: {e}")
-        # Если ошибка из-за фото, пробуем отправить как текст
+        # Пробуем отправить без фото
         if "Wrong type" in str(e) or "Failed to get http url content" in str(e):
             print("   Пробуем отправить без фото")
             try:
@@ -236,7 +261,7 @@ async def send_article(bot, title, url, description, rss_image):
         return False
 
 async def main():
-    print("🚀 Запуск футбольного бота с Mistral AI (картинки + пересказ)")
+    print("🚀 Запуск футбольного бота с Mistral (исправленный промпт)")
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     all_news = []
     for feed_url in RSS_FEEDS:
