@@ -4,10 +4,11 @@ import html
 import re
 import xml.etree.ElementTree as ET
 import requests
+import io
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin
 from dotenv import load_dotenv
-from telegram import Bot
+from telegram import Bot, InputFile
 from telegram.constants import ParseMode
 
 load_dotenv()
@@ -19,8 +20,8 @@ if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, MISTRAL_API_KEY]):
     print("❌ Ошибка: не хватает переменных окружения")
     exit(1)
 
-MAX_ARTICLES_PER_RUN = 1          # 1 новость за запуск
-MAX_AGE_HOURS = 72                # не старше 3 дней
+MAX_ARTICLES_PER_RUN = 1
+MAX_AGE_HOURS = 72
 RSS_TIMEOUT = 12
 PAGE_TIMEOUT = 12
 MISTRAL_MODEL = "mistral-tiny"
@@ -122,7 +123,6 @@ def fetch_page_image_and_text(url: str):
             return None, None
         html_content = resp.text
         
-        # Поиск картинки: og:image или первая <img>
         image = None
         og_match = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html_content)
         if not og_match:
@@ -141,7 +141,7 @@ def fetch_page_image_and_text(url: str):
                         image = img_url
                         break
         
-        # Извлечение текста
+        # Текст статьи
         clean = re.sub(r'<script.*?</script>', '', html_content, flags=re.DOTALL)
         clean = re.sub(r'<style.*?</style>', '', clean, flags=re.DOTALL)
         paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', clean, re.DOTALL)
@@ -165,14 +165,19 @@ def fetch_page_image_and_text(url: str):
         print(f"   Ошибка загрузки страницы {url}: {e}")
         return None, None
 
-def is_valid_image_url(url: str) -> bool:
-    """Проверяет, что URL ведёт на изображение (через HEAD-запрос)"""
+def download_image(image_url: str):
+    """Скачивает изображение, возвращает BytesIO или None"""
     try:
-        resp = requests.head(url, timeout=5, allow_redirects=True)
-        content_type = resp.headers.get('content-type', '')
-        return content_type.startswith('image/')
-    except:
-        return False
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(image_url, timeout=10, headers=headers)
+        if resp.status_code == 200 and resp.headers.get('content-type', '').startswith('image/'):
+            return io.BytesIO(resp.content)
+        else:
+            print(f"   Не удалось скачать картинку, статус {resp.status_code}")
+            return None
+    except Exception as e:
+        print(f"   Ошибка скачивания картинки: {e}")
+        return None
 
 def summarize_with_mistral(text: str) -> str:
     if not text or len(text) < 50:
@@ -228,23 +233,22 @@ async def send_article(bot, title, url, description, rss_image):
     page_image, full_text = await asyncio.to_thread(fetch_page_image_and_text, url)
     if not full_text:
         full_text = description if description else ""
-    
-    # Выбираем картинку, если она валидна
-    image = None
+
+    # Выбираем картинку
     candidate = page_image or rss_image
+    image_bytes = None
     if candidate and candidate.startswith(('http://', 'https://')):
-        if await asyncio.to_thread(is_valid_image_url, candidate):
-            image = candidate
-            print(f"   Картинка валидна: {image[:80]}")
+        print(f"   Скачиваем картинку: {candidate[:80]}")
+        image_bytes = await asyncio.to_thread(download_image, candidate)
+        if image_bytes:
+            print("   Картинка успешно скачана")
         else:
-            print(f"   Картинка невалидна (MIME-тип), отправляем без фото")
-    else:
-        print("   Нет подходящей картинки")
-    
+            print("   Не удалось скачать картинку, отправляем без фото")
+
     if not full_text:
         print("   Нет текста новости")
         return False
-    
+
     summary = await asyncio.to_thread(summarize_with_mistral, full_text)
     safe_title = html.escape(title)
     caption = f"⚽ <b>{safe_title}</b>\n\n{summary}"
@@ -252,28 +256,30 @@ async def send_article(bot, title, url, description, rss_image):
         max_summary_len = 1024 - len(f"⚽ <b>{safe_title}</b>\n\n") - 3
         summary = summary[:max_summary_len] + "..."
         caption = f"⚽ <b>{safe_title}</b>\n\n{summary}"
-    
+
     try:
-        if image:
-            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=image, caption=caption, parse_mode=ParseMode.HTML)
+        if image_bytes:
+            # Отправляем как файл
+            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=InputFile(image_bytes, filename="news.jpg"), caption=caption, parse_mode=ParseMode.HTML)
+            print(f"✅ Отправлено с фото (файл): {title[:60]}")
         else:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
-        print(f"✅ Отправлено: {title[:60]}")
+            print(f"✅ Отправлено текстом: {title[:60]}")
         return True
     except Exception as e:
         print(f"❌ Ошибка отправки: {e}")
-        # Пробуем без фото (если не пробовали)
-        if image:
-            print("   Пробуем отправить текстом")
+        # Последняя попытка: отправить без фото (если не пробовали)
+        if image_bytes:
             try:
                 await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
+                print("   ✅ Отправлено текстом после ошибки с фото")
                 return True
             except Exception as e2:
-                print(f"   ❌ Не удалось: {e2}")
+                print(f"   ❌ Не удалось и текстом: {e2}")
         return False
 
 async def main():
-    print("🚀 Запуск футбольного бота (проверка картинок, сохранение URL)")
+    print("🚀 Запуск футбольного бота (скачивание картинок, сохранение URL)")
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     
     sent_urls = load_sent_urls()
@@ -297,7 +303,6 @@ async def main():
     if not all_news:
         print("Нет новых футбольных новостей.")
         return
-    # Сортируем по дате (новые сверху)
     all_news.sort(key=lambda x: parse_rss_date(x[4]) or datetime.min, reverse=True)
     to_send = all_news[:MAX_ARTICLES_PER_RUN]
     print(f"Отправляю {len(to_send)} новостей...")
