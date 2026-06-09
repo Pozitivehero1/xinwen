@@ -2,13 +2,12 @@ import asyncio
 import os
 import html
 import re
+import xml.etree.ElementTree as ET
+import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.constants import ParseMode
-import feedparser
-import requests
-from bs4 import BeautifulSoup
 
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -18,12 +17,10 @@ if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
     print("❌ Ошибка: не загружены TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID")
     exit(1)
 
-# ================== НАСТРОЙКИ ==================
-MAX_ARTICLES_PER_RUN = 1          # только 1 новость за раз для стабильности
+# ------------------- НАСТРОЙКИ -------------------
+MAX_ARTICLES_PER_RUN = 1
 MAX_AGE_HOURS = 72
 SEND_INTERVAL_SEC = 20
-TIMEOUT_RSS = 10                  # таймаут на загрузку RSS в секундах
-TIMEOUT_PAGE = 15                 # таймаут на парсинг страницы
 
 RSS_FEEDS = [
     "http://www.rusfootball.info/rss.xml",
@@ -33,20 +30,19 @@ RSS_FEEDS = [
     "https://news.sportbox.ru/taxonomy/term/12216/0/feed"
 ]
 
+# Ключевые слова
 FOOTBALL_KEYWORDS = [
-    "футбол", "soccer", "football", "чемпионат", "лига чемпионов",
-    "евро", "кубок", "гол", "матч", "тренер", "игрок", "стадион",
-    "рфпл", "премьер-лига", "ла лига", "серия а", "бундеслига"
+    "футбол", "сборная", "чемпионат", "лига чемпионов", "евро",
+    "кубок", "гол", "матч", "тренер", "игрок", "стадион", "рфпл",
+    "премьер-лига", "ла лига", "серия а", "бундеслига"
 ]
 
 BLACKLIST_WORDS = [
-    "американский футбол", "nfl", "super bowl", "тревис келси", "travis kelce",
-    "тейлор свифт", "taylor swift", "свадьба", "баскетбол", "нба", "теннис"
+    "американский футбол", "nfl", "тейлор свифт", "баскетбол", "теннис"
 ]
 
-# ================== ФИЛЬТРЫ ==================
-def is_football_article(title: str, description: str) -> bool:
-    text = (title + " " + (description or "")).lower()
+def is_football(text):
+    text = text.lower()
     for bad in BLACKLIST_WORDS:
         if bad in text:
             return False
@@ -55,230 +51,167 @@ def is_football_article(title: str, description: str) -> bool:
             return True
     return False
 
-def is_recent(published_struct) -> bool:
-    if not published_struct:
-        return False
+def parse_rss_date(date_str):
+    # Парсим дату в формате RFC 2822 (пример: "Wed, 10 Jun 2026 12:00:00 +0300")
     try:
-        if hasattr(published_struct, 'tm_year'):
-            pub_dt = datetime(*published_struct[:6], tzinfo=timezone.utc)
-        elif isinstance(published_struct, datetime):
-            pub_dt = published_struct
-        else:
-            return False
-        now = datetime.now(timezone.utc)
-        age = now - pub_dt
-        return age.total_seconds() <= MAX_AGE_HOURS * 3600
-    except Exception:
-        return False
+        # Удаляем смещение, оставляем +0000
+        if date_str:
+            # Простейший разбор: берём первые 5 слов
+            parts = date_str.split()
+            if len(parts) >= 5:
+                # Собираем день, месяц, год, время
+                day = parts[1]
+                month = parts[2]
+                year = parts[3]
+                time = parts[4]
+                dt_str = f"{day} {month} {year} {time} +0000"
+                # Используем datetime.strptime с подстановкой английских названий месяцев
+                from email.utils import parsedate_to_datetime
+                return parsedate_to_datetime(date_str)
+    except:
+        pass
+    return None
 
-# ================== ПАРСИНГ RSS (с таймаутом) ==================
-def fetch_rss_with_timeout(feed_url):
+def fetch_rss(url):
+    print(f"📡 Загрузка RSS: {url}")
     try:
-        # feedparser.parse может зависнуть, поэтому запускаем в отдельном потоке с таймаутом
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(feedparser.parse, feed_url)
-            return future.result(timeout=TIMEOUT_RSS)
-    except concurrent.futures.TimeoutError:
-        print(f"   ⏰ Таймаут RSS: {feed_url}")
-        return None
-    except Exception as e:
-        print(f"   ❌ Ошибка RSS {feed_url}: {e}")
-        return None
-
-def fetch_rss_news():
-    all_news = []
-    for feed_url in RSS_FEEDS:
-        print(f"📡 Парсим RSS: {feed_url}")
-        feed = fetch_rss_with_timeout(feed_url)
-        if not feed:
-            continue
-        if feed.bozo:
-            print(f"   ⚠️ Ошибка парсинга: {feed.bozo_exception}")
-        for entry in feed.entries[:10]:
-            title = entry.get('title', '')
-            link = entry.get('link', '')
-            description = entry.get('summary', entry.get('description', ''))
-            if description:
-                soup = BeautifulSoup(description, 'html.parser')
-                description = soup.get_text(separator=' ', strip=True)
-            # Картинка из RSS
-            image_url = None
-            if 'media_content' in entry and entry.media_content:
-                image_url = entry.media_content[0].get('url')
-            elif 'enclosures' in entry and entry.enclosures:
-                for enc in entry.enclosures:
-                    if enc.get('type', '').startswith('image'):
-                        image_url = enc.get('href')
-                        break
-            published = entry.get('published_parsed')
-            if not title or not link:
-                continue
-            if not is_recent(published):
-                continue
-            if not is_football_article(title, description):
-                continue
-            all_news.append({
-                'title': title,
-                'url': link,
-                'description': description,
-                'image': image_url,
-                'published': published,
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            print(f"   Ошибка HTTP {resp.status_code}")
+            return []
+        root = ET.fromstring(resp.content)
+        # Пространство имен может быть, ищем channel/item
+        items = []
+        for item in root.findall('.//item'):
+            title = item.find('title')
+            link = item.find('link')
+            pub_date = item.find('pubDate')
+            description = item.find('description')
+            # Картинка: ищем enclosure или media:content
+            image = None
+            enclosure = item.find('enclosure')
+            if enclosure is not None and enclosure.get('type', '').startswith('image'):
+                image = enclosure.get('url')
+            if not image:
+                media = item.find('{http://search.yahoo.com/mrss/}content')
+                if media is not None:
+                    image = media.get('url')
+            items.append({
+                'title': title.text if title is not None else '',
+                'link': link.text if link is not None else '',
+                'pubDate': pub_date.text if pub_date is not None else '',
+                'description': description.text if description is not None else '',
+                'image': image
             })
-    # Убираем дубли по URL
-    unique = {}
-    for item in all_news:
-        if item['url'] not in unique:
-            unique[item['url']] = item
-    return list(unique.values())
+        print(f"   Найдено {len(items)} элементов")
+        return items
+    except Exception as e:
+        print(f"   Ошибка: {e}")
+        return []
 
-# ================== ПАРСИНГ СТРАНИЦЫ (с таймаутом) ==================
-def fetch_full_article(url: str):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+def fetch_full_text_and_image(url):
+    """Парсит страницу, возвращает (текст, картинка)"""
     try:
-        resp = requests.get(url, timeout=TIMEOUT_PAGE, headers=headers)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = requests.get(url, timeout=15)
         if resp.status_code != 200:
             return "", None
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        # Картинка
-        image_url = None
-        og_image = soup.find('meta', property='og:image')
-        if og_image and og_image.get('content'):
-            image_url = og_image['content']
-        else:
-            for img in soup.find_all('img'):
-                src = img.get('src')
-                if src and ('photo' in src or 'image' in src or 'news' in src):
-                    if not src.startswith('http'):
-                        src = requests.compat.urljoin(url, src)
-                    image_url = src
-                    break
-        # Текст
-        content = None
-        for selector in ['article', '.article-content', '.post-content', '.entry-content', '.content', '#main-content', '.news-detail', '.story__body']:
-            container = soup.select_one(selector)
-            if container:
-                content = container
-                break
-        if not content:
-            content = soup
-        for tag in content(['script', 'style', 'nav', 'footer', 'aside', 'form', 'button', 'meta', 'link']):
-            tag.decompose()
-        paragraphs = content.find_all('p')
+        html_content = resp.text
+        # Ищем картинку: og:image
+        img_match = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html_content)
+        image_url = img_match.group(1) if img_match else None
+        if not image_url:
+            # Первая картинка с src
+            img_match = re.search(r'<img[^>]+src=["\']([^"\']+\.(jpg|jpeg|png|webp))["\']', html_content, re.I)
+            if img_match:
+                image_url = img_match.group(1)
+        # Ищем текст: берём все параграфы внутри article или body
+        # Упрощённо: находим теги <p> и собираем их, отбрасывая короткие и мусорные
+        p_tags = re.findall(r'<p[^>]*>(.*?)</p>', html_content, re.DOTALL)
         text_parts = []
-        for p in paragraphs:
-            txt = p.get_text(strip=True)
-            if len(txt) > 40 and not txt.startswith('Читать'):
-                txt = re.sub(r'\d+\s*comment\s*', '', txt, flags=re.IGNORECASE)
-                txt = re.sub(r'Подписаться|Источник|Ссылка|Фото:', '', txt)
-                text_parts.append(txt)
-        full_text = '\n\n'.join(text_parts)
-        if len(full_text) > 3900:
-            full_text = full_text[:3900] + '...'
+        for p in p_tags:
+            # Очищаем от HTML-тегов
+            clean = re.sub(r'<[^>]+>', '', p).strip()
+            clean = re.sub(r'\s+', ' ', clean)
+            if len(clean) > 40 and not re.search(r'(читайте|подпишись|источник|реклама)', clean, re.I):
+                text_parts.append(clean)
+        full_text = '\n\n'.join(text_parts[:15])  # не больше 15 абзацев
+        if len(full_text) > 3500:
+            full_text = full_text[:3500] + '...'
         return full_text, image_url
     except Exception as e:
-        print(f"⚠️ Ошибка парсинга {url}: {e}")
+        print(f"   Ошибка парсинга страницы: {e}")
         return "", None
 
-# ================== ОТПРАВКА ==================
-async def send_article(bot: Bot, article: dict):
+async def send_article(bot, article):
     title = article['title']
-    url = article['url']
-    rss_desc = article.get('description', '')
-    rss_image = article.get('image')
-    
+    url = article['link']
+    rss_desc = article['description']
+    rss_image = article['image']
     print(f"📰 Обработка: {title[:60]}...")
-    # Парсим полный текст и картинку (с ограничением по времени)
-    try:
-        full_text, page_image = await asyncio.wait_for(
-            asyncio.to_thread(fetch_full_article, url),
-            timeout=TIMEOUT_PAGE + 5
-        )
-    except asyncio.TimeoutError:
-        print(f"   ⏰ Таймаут парсинга страницы: {url[:80]}...")
-        full_text, page_image = rss_desc, rss_image
+    # Проверка на футбол
+    if not is_football(title + ' ' + rss_desc):
+        print(f"   Пропущено (не футбол)")
+        return False
+    full_text, page_image = fetch_full_text_and_image(url)
     if not full_text:
         full_text = rss_desc if rss_desc else "Нет текста."
     image_url = page_image or rss_image
-    
     safe_title = html.escape(title)
+    # Отправляем фото с краткой подписью
     caption = f"⚽ <b>{safe_title}</b>\n\n{full_text[:800]}"
     if len(caption) > 1024:
         caption = caption[:1020] + "..."
-    
     try:
         if image_url:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=image_url,
-                caption=caption,
-                parse_mode=ParseMode.HTML
-            )
-            print(f"✅ Отправлено фото с подписью: {title[:60]}...")
+            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=image_url, caption=caption, parse_mode=ParseMode.HTML)
+            print(f"   Отправлено фото")
             if len(full_text) > 800:
-                text_message = f"<b>{safe_title}</b>\n\n{full_text}"
-                if len(text_message) > 4096:
-                    text_message = text_message[:4093] + "..."
-                await bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=text_message,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True
-                )
-                print(f"   ➕ Отправлен полный текст")
+                text_msg = f"<b>{safe_title}</b>\n\n{full_text}"
+                if len(text_msg) > 4096:
+                    text_msg = text_msg[:4093] + "..."
+                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text_msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                print(f"   Отправлен полный текст")
         else:
-            message = f"⚽ <b>{safe_title}</b>\n\n{full_text}"
-            if len(message) > 4096:
-                message = message[:4093] + "..."
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=message,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False
-            )
-            print(f"✅ Отправлен текст (без фото): {title[:60]}...")
+            text_msg = f"⚽ <b>{safe_title}</b>\n\n{full_text}"
+            if len(text_msg) > 4096:
+                text_msg = text_msg[:4093] + "..."
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text_msg, parse_mode=ParseMode.HTML)
+            print(f"   Отправлен текст без фото")
         return True
     except Exception as e:
-        print(f"❌ Ошибка отправки: {e}")
-        try:
-            plain = f"⚽ {title}\n\n{full_text}"
-            if len(plain) > 4096:
-                plain = plain[:4093] + "..."
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=plain)
-            print("   ✅ Отправлено в plain-режиме")
-            return True
-        except Exception as e2:
-            print(f"   ❌ Не удалось: {e2}")
-            return False
+        print(f"   Ошибка отправки: {e}")
+        return False
 
-# ================== MAIN С ГЛОБАЛЬНЫМ ТАЙМАУТОМ ==================
 async def main():
-    print("🚀 Запуск футбольного бота (фото + полный текст, с таймаутами)")
+    print("🚀 Запуск футбольного бота (минимальная версия)")
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    try:
-        # Устанавливаем общий таймаут на выполнение всего скрипта (2 минуты)
-        await asyncio.wait_for(inner_main(bot), timeout=120)
-    except asyncio.TimeoutError:
-        print("⏰ Глобальный таймаут: скрипт выполнялся слишком долго, прерываем.")
-    except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
-    print("✨ Скрипт завершён.")
-
-async def inner_main(bot: Bot):
-    # Получаем новости из RSS (эта функция синхронная, запустим в потоке)
-    news = await asyncio.to_thread(fetch_rss_news)
-    if not news:
-        print("Нет свежих футбольных новостей.")
+    all_news = []
+    for feed_url in RSS_FEEDS:
+        items = fetch_rss(feed_url)
+        for item in items:
+            # Фильтр по дате
+            pub_date = item.get('pubDate')
+            if pub_date:
+                dt = parse_rss_date(pub_date)
+                if dt:
+                    age = datetime.now(timezone.utc) - dt
+                    if age.total_seconds() > MAX_AGE_HOURS * 3600:
+                        continue
+            all_news.append(item)
+    if not all_news:
+        print("Нет новостей.")
         return
-    news.sort(key=lambda x: x.get('published'), reverse=True)
-    print(f"Найдено {len(news)} новостей. Отправлю {min(len(news), MAX_ARTICLES_PER_RUN)}.")
+    # Сортируем по дате (чем новее, тем выше)
+    all_news.sort(key=lambda x: x.get('pubDate', ''), reverse=True)
+    print(f"Найдено {len(all_news)} новостей. Отправляю {min(len(all_news), MAX_ARTICLES_PER_RUN)}.")
     sent = 0
-    for item in news[:MAX_ARTICLES_PER_RUN]:
+    for item in all_news[:MAX_ARTICLES_PER_RUN]:
         if await send_article(bot, item):
             sent += 1
             if sent < MAX_ARTICLES_PER_RUN:
                 await asyncio.sleep(SEND_INTERVAL_SEC)
-    print(f"✨ Готово. Отправлено {sent}.")
+    print(f"✨ Завершено. Отправлено {sent}.")
 
 if __name__ == "__main__":
     asyncio.run(main())
