@@ -1,13 +1,15 @@
-name: Football RSS Bot
+name: Football News Bot (30 min)
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '*/30 * * * *'   # каждые 30 минут
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -21,5 +23,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+        run: python gnews_bot_cn.py
+      - name: Commit sent URLs
         run: |
-          python gnews_bot_cn.py
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sent_urls.txt
+          git diff --staged --quiet || git commit -m "Update sent URLs [skip ci]"
+          git push
