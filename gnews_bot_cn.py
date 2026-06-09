@@ -18,12 +18,11 @@ if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, MISTRAL_API_KEY]):
     print("❌ Ошибка: не хватает переменных окружения")
     exit(1)
 
-# ================== НАСТРОЙКИ ==================
-MAX_ARTICLES_PER_RUN = 1          # можно увеличить до 2-3, но учтите лимит токенов
-MAX_AGE_HOURS = 72                # новости не старше 3 дней
+MAX_ARTICLES_PER_RUN = 1
+MAX_AGE_HOURS = 72
 RSS_TIMEOUT = 12
-PAGE_TIMEOUT = 15
-MISTRAL_MODEL = "mistral-tiny"    # бесплатная модель (или "mistral-small" для лучшего качества)
+PAGE_TIMEOUT = 10
+MISTRAL_MODEL = "mistral-tiny"  # или "mistral-small" для лучшего качества, но tiny бесплатно
 
 RSS_FEEDS = [
     "http://www.rusfootball.info/rss.xml",
@@ -81,18 +80,16 @@ def is_recent(date_str: str) -> bool:
 
 def fetch_rss_items(feed_url: str):
     try:
-        resp = requests.get(feed_url, timeout=RSS_TIMEOUT)
+        resp = requests.get(feed_url, timeout=RSS_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code != 200:
             return []
         root = ET.fromstring(resp.content)
         items = []
-        # RSS 2.0
         for item in root.findall(".//item"):
             title = item.findtext("title", "")
             link = item.findtext("link", "")
             desc = item.findtext("description", "")
             pub_date = item.findtext("pubDate", "")
-            # картинка
             image = None
             enc = item.find("enclosure")
             if enc is not None and enc.get("type", "").startswith("image"):
@@ -102,7 +99,6 @@ def fetch_rss_items(feed_url: str):
                 if media is not None:
                     image = media.get("url")
             items.append((title, link, desc, pub_date, image))
-        # если нет item, пробуем Atom
         if not items:
             for entry in root.findall(".//entry"):
                 title = entry.findtext("title", "")
@@ -110,33 +106,57 @@ def fetch_rss_items(feed_url: str):
                 link = link_el.get("href") if link_el is not None else ""
                 desc = entry.findtext("summary", "")
                 pub_date = entry.findtext("published", "")
-                image = None
-                items.append((title, link, desc, pub_date, image))
+                items.append((title, link, desc, pub_date, None))
         return items
     except Exception as e:
         print(f"Ошибка RSS {feed_url}: {e}")
         return []
 
-def fetch_page_image(url: str) -> str | None:
-    """Пытается достать og:image со страницы"""
+def fetch_page_image_and_text(url: str):
+    """Возвращает (image_url, full_text)"""
     try:
-        resp = requests.get(url, timeout=PAGE_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        resp = requests.get(url, timeout=PAGE_TIMEOUT, headers=headers)
         if resp.status_code != 200:
-            return None
-        match = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', resp.text)
+            return None, None
+        html_content = resp.text
+        # og:image
+        image = None
+        match = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html_content)
+        if not match:
+            match = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', html_content)
         if match:
-            return match.group(1)
-        return None
-    except:
-        return None
+            image = match.group(1)
+        # извлечение текста (удаляем скрипты, стили, мусор)
+        clean = re.sub(r'<script.*?</script>', '', html_content, flags=re.DOTALL)
+        clean = re.sub(r'<style.*?</style>', '', clean, flags=re.DOTALL)
+        # ищем параграфы
+        paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', clean, re.DOTALL)
+        texts = []
+        for p in paragraphs:
+            text = re.sub(r'<[^>]+>', '', p).strip()
+            if len(text) > 40 and not text.startswith("Читать") and not text.startswith("Источник"):
+                text = re.sub(r'\d+\s*comment', '', text, flags=re.IGNORECASE)
+                texts.append(text)
+            if len(texts) >= 15:
+                break
+        full_text = "\n\n".join(texts)
+        if len(full_text) > 3000:
+            full_text = full_text[:3000] + "..."
+        return image, full_text
+    except Exception as e:
+        print(f"   Ошибка загрузки страницы {url}: {e}")
+        return None, None
 
-def summarize_with_mistral(text: str, max_chars: int = 900) -> str:
-    """Отправляет текст в Mistral API и возвращает краткий пересказ"""
+def summarize_with_mistral(text: str, max_tokens: int = 350) -> str:
+    """Пересказ новости, достаточно подробный, но укладывающийся в лимит подписи к фото"""
     if not text or len(text) < 50:
         return text
-    prompt = f"Перескажи эту футбольную новость кратко, только самое важное, без рекламы и лишних деталей. Ограничься 500-700 символами. Новость:\n{text[:2000]}"
+    prompt = f"""Ты спортивный журналист. Перескажи эту футбольную новость кратко, но содержательно, примерно 300-500 символов. Выдели главные события, имена, счёт, интригу. Не добавляй рекламу, не упоминай сайт. Новость:
+
+{text[:2000]}"""
     try:
-        response = requests.post(
+        resp = requests.post(
             "https://api.mistral.ai/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {MISTRAL_API_KEY}",
@@ -145,79 +165,60 @@ def summarize_with_mistral(text: str, max_chars: int = 900) -> str:
             json={
                 "model": MISTRAL_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 300
+                "temperature": 0.4,
+                "max_tokens": max_tokens
             },
-            timeout=25
+            timeout=20
         )
-        if response.status_code == 200:
-            data = response.json()
+        if resp.status_code == 200:
+            data = resp.json()
             summary = data["choices"][0]["message"]["content"].strip()
-            if len(summary) > max_chars:
-                summary = summary[:max_chars-3] + "..."
+            # обрезаем, если слишком длинное (лимит подписи 1024, но мы потом ещё заголовок добавим)
+            if len(summary) > 800:
+                summary = summary[:800] + "..."
             return summary
         else:
-            print(f"Mistral ошибка {response.status_code}: {response.text[:200]}")
+            print(f"Mistral ошибка {resp.status_code}: {resp.text[:200]}")
             return text
     except Exception as e:
         print(f"Mistral исключение: {e}")
         return text
 
 async def send_article(bot, title, url, description, rss_image):
-    # Парсим картинку со страницы, если в RSS нет
-    image = rss_image
-    if not image:
-        image = await asyncio.to_thread(fetch_page_image, url)
-    # Пытаемся получить полный текст новости (первые абзацы)
-    full_text = description
-    if len(full_text) < 200:
-        # если описание короткое, попробуем спарсить несколько абзацев со страницы (без заморочек)
-        try:
-            resp = requests.get(url, timeout=PAGE_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code == 200:
-                # убираем скрипты
-                clean = re.sub(r'<script.*?</script>', '', resp.text, flags=re.DOTALL)
-                clean = re.sub(r'<style.*?</style>', '', clean, flags=re.DOTALL)
-                paras = re.findall(r'<p[^>]*>(.*?)</p>', clean, re.DOTALL)
-                texts = []
-                for p in paras:
-                    txt = re.sub(r'<[^>]+>', '', p).strip()
-                    if len(txt) > 40 and not txt.startswith("Читать"):
-                        texts.append(txt)
-                    if len(texts) >= 6:
-                        break
-                if texts:
-                    full_text = "\n\n".join(texts)
-        except:
-            pass
-    # Перефразирование через Mistral
-    if full_text:
-        summarized = await asyncio.to_thread(summarize_with_mistral, full_text, 900)
-    else:
-        summarized = "Нет текста новости."
+    # Пытаемся получить картинку и полный текст со страницы
+    print(f"📰 Загружаем страницу: {title[:50]}...")
+    page_image, full_text = await asyncio.to_thread(fetch_page_image_and_text, url)
+    if not full_text:
+        full_text = description if description else ""
+    if not page_image:
+        page_image = rss_image
+    # Если нет текста, ничего не отправляем
+    if not full_text:
+        print("   Нет текста новости")
+        return False
+    # Пересказываем через Mistral
+    summary = await asyncio.to_thread(summarize_with_mistral, full_text, 400)
     safe_title = html.escape(title)
-    caption = f"⚽ <b>{safe_title}</b>\n\n{summarized}"
+    # Формируем подпись: заголовок + пересказ
+    caption = f"⚽ <b>{safe_title}</b>\n\n{summary}"
     if len(caption) > 1024:
-        caption = caption[:1020] + "..."
+        # обрезаем пересказ, если нужно
+        excess = len(caption) - 1020
+        summary = summary[:-excess] + "..."
+        caption = f"⚽ <b>{safe_title}</b>\n\n{summary}"
     try:
-        if image:
-            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=image, caption=caption, parse_mode=ParseMode.HTML)
+        if page_image:
+            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=page_image, caption=caption, parse_mode=ParseMode.HTML)
         else:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
         print(f"✅ Отправлено: {title[:60]}")
         return True
     except Exception as e:
         print(f"❌ Ошибка отправки: {e}")
-        # пробуем отправить без HTML
-        try:
-            plain = f"⚽ {title}\n\n{summarized}"
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=plain)
-            return True
-        except:
-            return False
+        return False
 
 async def main():
-    print("🚀 Запуск футбольного бота с Mistral AI")
+    print("🚀 Запуск футбольного бота с Mistral AI (картинки + пересказ)")
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     all_news = []
     for feed_url in RSS_FEEDS:
@@ -235,7 +236,6 @@ async def main():
     if not all_news:
         print("Нет свежих футбольных новостей.")
         return
-    # сортируем по дате (новые сверху)
     all_news.sort(key=lambda x: parse_rss_date(x[4]) or datetime.min, reverse=True)
     to_send = all_news[:MAX_ARTICLES_PER_RUN]
     print(f"Отправляю {len(to_send)} новостей...")
