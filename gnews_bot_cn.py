@@ -5,6 +5,7 @@ import re
 import xml.etree.ElementTree as ET
 import requests
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urljoin
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.constants import ParseMode
@@ -21,8 +22,8 @@ if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, MISTRAL_API_KEY]):
 MAX_ARTICLES_PER_RUN = 1
 MAX_AGE_HOURS = 72
 RSS_TIMEOUT = 12
-PAGE_TIMEOUT = 10
-MISTRAL_MODEL = "mistral-tiny"  # или "mistral-small" для лучшего качества, но tiny бесплатно
+PAGE_TIMEOUT = 12
+MISTRAL_MODEL = "mistral-tiny"   # бесплатно, либо "mistral-small"
 
 RSS_FEEDS = [
     "http://www.rusfootball.info/rss.xml",
@@ -113,11 +114,11 @@ def fetch_rss_items(feed_url: str):
         return []
 
 def fetch_page_image_and_text(url: str):
-    """Возвращает (image_url, full_text)"""
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         resp = requests.get(url, timeout=PAGE_TIMEOUT, headers=headers)
         if resp.status_code != 200:
+            print(f"   Страница ответила кодом {resp.status_code}")
             return None, None
         html_content = resp.text
         # og:image
@@ -127,10 +128,11 @@ def fetch_page_image_and_text(url: str):
             match = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', html_content)
         if match:
             image = match.group(1)
-        # извлечение текста (удаляем скрипты, стили, мусор)
+            if image.startswith('/'):
+                image = urljoin(url, image)
+        # извлечение текста
         clean = re.sub(r'<script.*?</script>', '', html_content, flags=re.DOTALL)
         clean = re.sub(r'<style.*?</style>', '', clean, flags=re.DOTALL)
-        # ищем параграфы
         paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', clean, re.DOTALL)
         texts = []
         for p in paragraphs:
@@ -138,21 +140,24 @@ def fetch_page_image_and_text(url: str):
             if len(text) > 40 and not text.startswith("Читать") and not text.startswith("Источник"):
                 text = re.sub(r'\d+\s*comment', '', text, flags=re.IGNORECASE)
                 texts.append(text)
-            if len(texts) >= 15:
+            if len(texts) >= 12:
                 break
         full_text = "\n\n".join(texts)
         if len(full_text) > 3000:
             full_text = full_text[:3000] + "..."
+        if image:
+            print(f"   Найдена картинка: {image[:80]}")
+        else:
+            print("   Картинка не найдена")
         return image, full_text
     except Exception as e:
         print(f"   Ошибка загрузки страницы {url}: {e}")
         return None, None
 
-def summarize_with_mistral(text: str, max_tokens: int = 350) -> str:
-    """Пересказ новости, достаточно подробный, но укладывающийся в лимит подписи к фото"""
+def summarize_with_mistral(text: str, max_tokens: int = 400) -> str:
     if not text or len(text) < 50:
         return text
-    prompt = f"""Ты спортивный журналист. Перескажи эту футбольную новость кратко, но содержательно, До 1024 символов. Выдели главные события, имена, счёт, интригу. Не добавляй рекламу, не упоминай сайт. Новость:
+    prompt = f"""Ты спортивный журналист. Перескажи эту футбольную новость кратко, но содержательно, примерно 300-500 символов. Выдели главные события, имена, счёт, интригу. Не добавляй рекламу, не упоминай сайт. Новость:
 
 {text[:2000]}"""
     try:
@@ -173,7 +178,6 @@ def summarize_with_mistral(text: str, max_tokens: int = 350) -> str:
         if resp.status_code == 200:
             data = resp.json()
             summary = data["choices"][0]["message"]["content"].strip()
-            # обрезаем, если слишком длинное (лимит подписи 1024, но мы потом ещё заголовок добавим)
             if len(summary) > 800:
                 summary = summary[:800] + "..."
             return summary
@@ -185,36 +189,50 @@ def summarize_with_mistral(text: str, max_tokens: int = 350) -> str:
         return text
 
 async def send_article(bot, title, url, description, rss_image):
-    # Пытаемся получить картинку и полный текст со страницы
     print(f"📰 Загружаем страницу: {title[:50]}...")
     page_image, full_text = await asyncio.to_thread(fetch_page_image_and_text, url)
     if not full_text:
         full_text = description if description else ""
-    if not page_image:
-        page_image = rss_image
-    # Если нет текста, ничего не отправляем
+    # Выбираем картинку: сначала со страницы, потом из RSS, только если валидный http
+    image = None
+    if page_image and page_image.startswith(('http://', 'https://')):
+        image = page_image
+    elif rss_image and rss_image.startswith(('http://', 'https://')):
+        image = rss_image
+    if image:
+        print(f"   Используем картинку: {image[:80]}")
+    else:
+        print("   Картинка отсутствует, будем отправлять только текст")
     if not full_text:
         print("   Нет текста новости")
         return False
-    # Пересказываем через Mistral
+    # Пересказ через Mistral
     summary = await asyncio.to_thread(summarize_with_mistral, full_text, 400)
     safe_title = html.escape(title)
-    # Формируем подпись: заголовок + пересказ
     caption = f"⚽ <b>{safe_title}</b>\n\n{summary}"
     if len(caption) > 1024:
-        # обрезаем пересказ, если нужно
-        excess = len(caption) - 1020
-        summary = summary[:-excess] + "..."
+        # Обрезаем пересказ
+        max_summary_len = 1024 - len(f"⚽ <b>{safe_title}</b>\n\n") - 3
+        summary = summary[:max_summary_len] + "..."
         caption = f"⚽ <b>{safe_title}</b>\n\n{summary}"
     try:
-        if page_image:
-            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=page_image, caption=caption, parse_mode=ParseMode.HTML)
+        if image:
+            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=image, caption=caption, parse_mode=ParseMode.HTML)
         else:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
         print(f"✅ Отправлено: {title[:60]}")
         return True
     except Exception as e:
         print(f"❌ Ошибка отправки: {e}")
+        # Если ошибка из-за фото, пробуем отправить как текст
+        if "Wrong type" in str(e) or "Failed to get http url content" in str(e):
+            print("   Пробуем отправить без фото")
+            try:
+                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
+                print("   ✅ Отправлено текстом")
+                return True
+            except Exception as e2:
+                print(f"   ❌ Не удалось и текстом: {e2}")
         return False
 
 async def main():
