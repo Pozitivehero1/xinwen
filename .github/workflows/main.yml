@@ -1,8 +1,8 @@
-name: Run Football News Bot
+name: Football RSS Bot
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # каждые 6 часов, настройте как нужно
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 jobs:
@@ -15,9 +15,8 @@ jobs:
         with:
           python-version: '3.10'
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-      - name: Run bot script
+        run: pip install -r requirements.txt
+      - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
