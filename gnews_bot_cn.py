@@ -27,10 +27,11 @@ PAGE_TIMEOUT = 12
 MISTRAL_MODEL = "mistral-tiny"
 
 RSS_FEEDS = [
-    "http://www.rusfootball.info/rss.xml",
-    "http://www.euro-football.ru/news/news_xml_redtram.php3",
-    "http://www.gazeta.ru/export/rss/sportnews.xml",
-    "https://news.sportbox.ru/taxonomy/term/12216/0/feed"
+    "http://www.rusfootball.info/rss.xml",                # Новости российского и мирового футбола
+    "https://www.rusfootball.info/world/",                # Специально зарубежный футбол
+    "http://www.gazeta.ru/export/rss/sportnews.xml",      # Общая спортивная лента
+    "http://newsrss.bbc.co.uk/russki/sport/rss.xml",      # BBC Sport на русском
+    "https://www.footballcritic.com/rss",                 # Международный источник
 ]
 
 FOOTBALL_KEYWORDS = [
