@@ -21,21 +21,19 @@ if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, MISTRAL_API_KEY]):
     exit(1)
 
 # ================== НАСТРОЙКИ ==================
-MAX_ARTICLES_PER_RUN = 1          # сколько новостей за раз (можно увеличить до 2-3)
-MAX_AGE_HOURS = 72                # не старше 3 дней
+MAX_ARTICLES_PER_RUN = 1
+MAX_AGE_HOURS = 72
 RSS_TIMEOUT = 12
 PAGE_TIMEOUT = 12
-MISTRAL_MODEL = "mistral-tiny"    # бесплатно
+MISTRAL_MODEL = "mistral-tiny"
 
-# Список RSS-лент (упор на зарубежный футбол)
 RSS_FEEDS = [
-    "https://www.sports.ru/rss/",                                   # Sports.ru – много зарубежного
-    "https://www.championat.com/rss/news/football.xml",             # Чемпионат – футбол
-    "http://feeds.bbci.co.uk/sport/football/rss.xml",               # BBC World Football (англ.)
-    "http://www.rusfootball.info/rss.xml",                          # запасной (будет меньше приоритет)
+    "https://www.sports.ru/rss/",
+    "https://www.championat.com/rss/news/football.xml",
+    "http://feeds.bbci.co.uk/sport/football/rss.xml",
+    "http://www.rusfootball.info/rss.xml",
 ]
 
-# Белый список – ключевые слова футбола (можно дополнять)
 FOOTBALL_KEYWORDS = [
     "футбол", "soccer", "football", "чемпионат", "лига чемпионов", "евро",
     "кубок", "гол", "матч", "тренер", "игрок", "стадион", "рфпл", "премьер-лига",
@@ -45,7 +43,6 @@ FOOTBALL_KEYWORDS = [
     "челси", "ювентус", "милан", "интер", "трансфер", "контракт", "слух"
 ]
 
-# Чёрный список – что исключаем (баскетбол, теннис, российские соревнования)
 BLACKLIST_WORDS = [
     "баскетбол", "нба", "теннис", "хоккей", "американский футбол", "nfl",
     "тейлор свифт", "свадьба", "тревис келси",
@@ -54,7 +51,6 @@ BLACKLIST_WORDS = [
     "ахмат", "рубин", "ростов", "химки", "конкурс рфпл", "матч премьер-лиги россии"
 ]
 
-# Приоритеты ключевых слов (чем выше число, тем важнее)
 PRIORITY_KEYWORDS = {
     3: [
         "реал мадрид", "барселона", "бавария", "псж", "манчестер сити",
@@ -69,14 +65,13 @@ PRIORITY_KEYWORDS = {
     1: [
         "мбappe", "холанд", "винисиус", "беллингем", "кейн", "салах", "де брюйне",
         "левандовски", "неймар", "месси", "роналду", "модрич", "ван дейк",
-        "куртуа", "доннарумма", "нойер","педри", "ольмо", "ямаль", "винисиус", "вальверде", "моуриньо", "сборная франции", "сборная англии",
+        "куртуа", "доннарумма", "нойер", "сборная франции", "сборная англии",
         "сборная бразилии", "сборная аргентины", "сборная испании",
         "сборная германии", "сборная португалии", "сборная нидерландов",
         "чемпионат мира", "кубок африки", "кубок америки", "евро"
     ],
 }
 
-# ================== ФУНКЦИИ ==================
 def is_football_article(title: str, desc: str) -> bool:
     text = (title + " " + (desc or "")).lower()
     for bad in BLACKLIST_WORDS:
@@ -219,12 +214,17 @@ def download_image(image_url: str):
         print(f"   Ошибка скачивания картинки: {e}")
         return None
 
-def summarize_with_mistral(text: str) -> str:
+def summarize_with_mistral(title: str, text: str) -> tuple[str, str]:
+    """Возвращает (русский_заголовок, русский_пересказ) без звёздочек"""
     if not text or len(text) < 50:
-        return text
-    prompt = f"""Ты спортивный журналист. Перескажи эту футбольную новость кратко, но содержательно, примерно 300-500 символов. Выдели главные события, имена, счёт, интригу. Не добавляй рекламу, не упоминай сайт. Новость:
+        return title, text
+    prompt = f"""Переведи и перескажи футбольную новость на русский язык. 
+Сначала напиши заголовок на русском (без звёздочек, без кавычек, просто предложение). 
+Затем через пустую строку напиши краткий пересказ (3-5 предложений) только по существу: события, имена, счёт, интрига. 
+Не используй звёздочки (*), не используй шаблонные фразы "если известно", "уточнить". Не добавляй рекламу.
 
-{text[:2000]}"""
+Оригинальный заголовок: {title}
+Текст новости: {text[:2000]}"""
     try:
         resp = requests.post(
             "https://api.mistral.ai/v1/chat/completions",
@@ -236,25 +236,33 @@ def summarize_with_mistral(text: str) -> str:
                 "model": MISTRAL_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
-                "max_tokens": 400
+                "max_tokens": 500
             },
             timeout=20
         )
         if resp.status_code == 200:
             data = resp.json()
-            summary = data["choices"][0]["message"]["content"].strip()
-            if any(bad in summary for bad in ["если известен", "уточнить", "X:X", "ключевые моменты"]):
-                print("   Пересказ содержит шаблонный мусор, используем оригинальный текст")
-                return text[:800]
-            if len(summary) > 800:
-                summary = summary[:800] + "..."
-            return summary
+            result = data["choices"][0]["message"]["content"].strip()
+            # Убираем звёздочки
+            result = re.sub(r'\*+', '', result)
+            # Разделяем заголовок и пересказ (первая строка — заголовок, остальное — пересказ)
+            lines = result.split('\n', 1)
+            new_title = lines[0].strip()
+            summary = lines[1].strip() if len(lines) > 1 else ""
+            if not new_title:
+                new_title = title
+            if not summary:
+                summary = text[:800]
+            # Убираем лишние пробелы
+            new_title = re.sub(r'\s+', ' ', new_title)
+            summary = re.sub(r'\s+', ' ', summary)
+            return new_title, summary
         else:
             print(f"Mistral ошибка {resp.status_code}")
-            return text
+            return title, text[:800]
     except Exception as e:
         print(f"Mistral исключение: {e}")
-        return text
+        return title, text[:800]
 
 def load_sent_urls():
     if not os.path.exists('sent_urls.txt'):
@@ -287,13 +295,18 @@ async def send_article(bot, title, url, description, rss_image):
         print("   Нет текста новости")
         return False
 
-    summary = await asyncio.to_thread(summarize_with_mistral, full_text)
-    safe_title = html.escape(title)
+    # Получаем переведённый заголовок и пересказ
+    new_title, summary = await asyncio.to_thread(summarize_with_mistral, title, full_text)
+    safe_title = html.escape(new_title)
     caption = f"⚽ <b>{safe_title}</b>\n\n{summary}"
+    # Финальная очистка от звёздочек
+    caption = re.sub(r'\*+', '', caption)
+
     if len(caption) > 1024:
         max_summary_len = 1024 - len(f"⚽ <b>{safe_title}</b>\n\n") - 3
         summary = summary[:max_summary_len] + "..."
         caption = f"⚽ <b>{safe_title}</b>\n\n{summary}"
+        caption = re.sub(r'\*+', '', caption)
 
     try:
         if image_bytes:
@@ -315,7 +328,7 @@ async def send_article(bot, title, url, description, rss_image):
         return False
 
 async def main():
-    print("🚀 Запуск футбольного бота (приоритет топ-клубов и трансферов)")
+    print("🚀 Запуск футбольного бота (перевод заголовка, удаление звёздочек)")
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
     sent_urls = load_sent_urls()
