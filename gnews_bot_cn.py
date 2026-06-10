@@ -224,16 +224,27 @@ def download_image(image_url: str):
         return None
 
 def summarize_with_mistral(title: str, text: str) -> tuple[str, str]:
-    """Возвращает (русский_заголовок, русский_пересказ) без звёздочек"""
+    """Возвращает (русский_заголовок, русский_пересказ) без ссылок на источники и без придумок."""
     if not text or len(text) < 50:
         return title, text
-    prompt = f"""Переведи и перескажи футбольную новость на русский язык. 
-Сначала напиши заголовок на русском (без звёздочек, без кавычек, просто предложение). 
-Затем через пустую строку напиши краткий пересказ (3-5 предложений) только по существу: события, имена, счёт, интрига. 
-Не используй звёздочки (*), не используй шаблонные фразы "если известно", "уточнить". Не добавляй рекламу.
 
+    prompt = f"""Твоя задача — пересказать новость, используя ТОЛЬКО информацию из раздела "ТЕКСТ НОВОСТИ". Твои собственные знания о футболе устарели и недостоверны. НЕ ДОБАВЛЯЙ ничего от себя.
+
+**ПРАВИЛА:**
+1. НЕ УПОМИНАЙ источники: никаких "BBC", "журналист", "согласно сайту", "по информации". Пиши новость как факт: "Реал рассматривает...", "Игрок подписал контракт...".
+2. НЕ ПРИДУМЫВАЙ имена, счета, даты, которых нет в тексте.
+3. НЕ ПИШИ "по сообщению источника", "как сообщает...".
+4. НЕ НАЧИНАЙ со слов "Новость:", "Заголовок:".
+5. Выдай ответ в формате:
+   Заголовок (на русском, кратко)
+   (пустая строка)
+   Пересказ (2-4 предложения, только суть)
+
+---
+ТЕКСТ НОВОСТИ:
 Оригинальный заголовок: {title}
-Текст новости: {text[:2000]}"""
+Текст: {text[:2000]}
+---"""
     try:
         resp = requests.post(
             "https://api.mistral.ai/v1/chat/completions",
@@ -252,19 +263,25 @@ def summarize_with_mistral(title: str, text: str) -> tuple[str, str]:
         if resp.status_code == 200:
             data = resp.json()
             result = data["choices"][0]["message"]["content"].strip()
-            # Убираем звёздочки
-            result = re.sub(r'\*+', '', result)
-            # Разделяем заголовок и пересказ (первая строка — заголовок, остальное — пересказ)
-            lines = result.split('\n', 1)
-            new_title = lines[0].strip()
-            summary = lines[1].strip() if len(lines) > 1 else ""
+            # Удаляем звёздочки, кавычки-ёлочки
+            result = re.sub(r'[\*\「」]', '', result)
+            # Разделяем заголовок и пересказ
+            parts = result.split('\n', 1)
+            new_title = parts[0].strip()
+            summary = parts[1].strip() if len(parts) > 1 else ""
             if not new_title:
                 new_title = title
             if not summary:
                 summary = text[:800]
-            # Убираем лишние пробелы
-            new_title = re.sub(r'\s+', ' ', new_title)
-            summary = re.sub(r'\s+', ' ', summary)
+            # Жёсткое удаление фраз-маркеров
+            for phrase in [r'по информации\s*\w*', r'согласно\s*\w*', r'журналист\s*\w*',
+                           r'источник\s*\w*', r'на сайте\s*\w*', r'новость:', r'заголовок:',
+                           r'bbc', r'sport', r'ru', r'com']:
+                summary = re.sub(phrase, '', summary, flags=re.IGNORECASE)
+                new_title = re.sub(phrase, '', new_title, flags=re.IGNORECASE)
+            # Очистка пробелов
+            new_title = re.sub(r'\s+', ' ', new_title).strip()
+            summary = re.sub(r'\s+', ' ', summary).strip()
             return new_title, summary
         else:
             print(f"Mistral ошибка {resp.status_code}")
