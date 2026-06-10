@@ -20,37 +20,77 @@ if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, MISTRAL_API_KEY]):
     print("❌ Ошибка: не хватает переменных окружения")
     exit(1)
 
-MAX_ARTICLES_PER_RUN = 1
-MAX_AGE_HOURS = 72
+# ================== НАСТРОЙКИ ==================
+MAX_ARTICLES_PER_RUN = 1          # сколько новостей за раз (можно увеличить до 2-3)
+MAX_AGE_HOURS = 72                # не старше 3 дней
 RSS_TIMEOUT = 12
 PAGE_TIMEOUT = 12
-MISTRAL_MODEL = "mistral-tiny"
+MISTRAL_MODEL = "mistral-tiny"    # бесплатно
 
+# Список RSS-лент (упор на зарубежный футбол)
 RSS_FEEDS = [
-    #"http://www.rusfootball.info/rss.xml",                          # оставить как запасной (но будет много России)
     "https://www.sports.ru/rss/",                                   # Sports.ru – много зарубежного
     "https://www.championat.com/rss/news/football.xml",             # Чемпионат – футбол
     "http://feeds.bbci.co.uk/sport/football/rss.xml",               # BBC World Football (англ.)
+    "http://www.rusfootball.info/rss.xml",                          # запасной (будет меньше приоритет)
 ]
 
+# Белый список – ключевые слова футбола (можно дополнять)
 FOOTBALL_KEYWORDS = [
     "футбол", "soccer", "football", "чемпионат", "лига чемпионов", "евро",
     "кубок", "гол", "матч", "тренер", "игрок", "стадион", "рфпл", "премьер-лига",
-    "ла лига", "серия а", "бундеслига", "локомотив", "спартак", "зенит", "цска",
-    "динамо", "краснодар", "ростов", "рубин", "реал", "барселона", "бавария", "псж"
+    "ла лига", "серия а", "бундеслига", "лига 1", "апл", "уефа",
+    "локомотив", "спартак", "зенит", "цска", "динамо", "краснодар", "ростов",
+    "реал", "барселона", "бавария", "псж", "манчестер", "ливерпуль", "арсенал",
+    "челси", "ювентус", "милан", "интер", "трансфер", "контракт", "слух"
 ]
 
+# Чёрный список – что исключаем (баскетбол, теннис, российские соревнования)
 BLACKLIST_WORDS = [
     "баскетбол", "нба", "теннис", "хоккей", "американский футбол", "nfl",
-    "тейлор свифт", "свадьба", "тревис келси"
+    "тейлор свифт", "свадьба", "тревис келси",
+    "рфпл", "рпл", "фнл", "кубок россии", "россия", "российский",
+    "зенит", "спартак", "цска", "локомотив", "краснодар", "динамо", "арсенал тула",
+    "ахмат", "рубин", "ростов", "химки", "конкурс рфпл", "матч премьер-лиги россии"
 ]
 
+# Приоритеты ключевых слов (чем выше число, тем важнее)
+PRIORITY_KEYWORDS = {
+    3: [
+        "реал мадрид", "барселона", "бавария", "псж", "манчестер сити",
+        "манчестер юнайтед", "ливерпуль", "арсенал", "челси", "ювентус",
+        "милан", "интер", "наполи", "лига чемпионов", "уефа", "апл",
+        "премьер-лига", "ла лига", "серия а", "бундеслига", "лига 1"
+    ],
+    2: [
+        "трансфер", "слух", "контракт", "продлил", "подписал", "переход",
+        "аренда", "агент", "зарплата", "бонус", "клаусула", "сумма сделки"
+    ],
+    1: [
+        "мбappe", "холанд", "винисиус", "беллингем", "кейн", "салах", "де брюйне",
+        "левандовски", "неймар", "месси", "роналду", "модрич", "ван дейк",
+        "куртуа", "доннарумма", "нойер","педри", "ольмо", "ямаль", "винисиус", "вальверде", "моуриньо", "сборная франции", "сборная англии",
+        "сборная бразилии", "сборная аргентины", "сборная испании",
+        "сборная германии", "сборная португалии", "сборная нидерландов",
+        "чемпионат мира", "кубок африки", "кубок америки", "евро"
+    ],
+}
+
+# ================== ФУНКЦИИ ==================
 def is_football_article(title: str, desc: str) -> bool:
     text = (title + " " + (desc or "")).lower()
     for bad in BLACKLIST_WORDS:
         if bad in text:
             return False
     return any(kw in text for kw in FOOTBALL_KEYWORDS)
+
+def compute_priority(title: str, desc: str) -> int:
+    text = (title + " " + (desc or "")).lower()
+    for weight, keywords in PRIORITY_KEYWORDS.items():
+        for kw in keywords:
+            if kw in text:
+                return weight
+    return 0
 
 def parse_rss_date(date_str: str):
     if not date_str:
@@ -122,7 +162,8 @@ def fetch_page_image_and_text(url: str):
             print(f"   Страница ответила кодом {resp.status_code}")
             return None, None
         html_content = resp.text
-        
+
+        # Поиск картинки
         image = None
         og_match = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html_content)
         if not og_match:
@@ -140,8 +181,8 @@ def fetch_page_image_and_text(url: str):
                     if 'logo' not in img_url.lower() and 'icon' not in img_url.lower():
                         image = img_url
                         break
-        
-        # Текст статьи
+
+        # Парсинг текста
         clean = re.sub(r'<script.*?</script>', '', html_content, flags=re.DOTALL)
         clean = re.sub(r'<style.*?</style>', '', clean, flags=re.DOTALL)
         paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', clean, re.DOTALL)
@@ -166,7 +207,6 @@ def fetch_page_image_and_text(url: str):
         return None, None
 
 def download_image(image_url: str):
-    """Скачивает изображение, возвращает BytesIO или None"""
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(image_url, timeout=10, headers=headers)
@@ -182,9 +222,8 @@ def download_image(image_url: str):
 def summarize_with_mistral(text: str) -> str:
     if not text or len(text) < 50:
         return text
-    prompt = f"""Перескажи футбольную новость коротко (3-5 предложений), только факты: кто, что, где, когда, какой счёт (если есть). Не используй фразы "если известно", "уточнить", "ключевые моменты" и не пиши шаблонные заглушки. Просто напиши связный текст.
+    prompt = f"""Ты спортивный журналист. Перескажи эту футбольную новость кратко, но содержательно, примерно 300-500 символов. Выдели главные события, имена, счёт, интригу. Не добавляй рекламу, не упоминай сайт. Новость:
 
-Новость:
 {text[:2000]}"""
     try:
         resp = requests.post(
@@ -197,7 +236,7 @@ def summarize_with_mistral(text: str) -> str:
                 "model": MISTRAL_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
-                "max_tokens": 350
+                "max_tokens": 400
             },
             timeout=20
         )
@@ -234,7 +273,6 @@ async def send_article(bot, title, url, description, rss_image):
     if not full_text:
         full_text = description if description else ""
 
-    # Выбираем картинку
     candidate = page_image or rss_image
     image_bytes = None
     if candidate and candidate.startswith(('http://', 'https://')):
@@ -259,32 +297,30 @@ async def send_article(bot, title, url, description, rss_image):
 
     try:
         if image_bytes:
-            # Отправляем как файл
             await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=InputFile(image_bytes, filename="news.jpg"), caption=caption, parse_mode=ParseMode.HTML)
-            print(f"✅ Отправлено с фото (файл): {title[:60]}")
+            print(f"✅ Отправлено с фото: {title[:60]}")
         else:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
             print(f"✅ Отправлено текстом: {title[:60]}")
         return True
     except Exception as e:
         print(f"❌ Ошибка отправки: {e}")
-        # Последняя попытка: отправить без фото (если не пробовали)
         if image_bytes:
             try:
                 await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
                 print("   ✅ Отправлено текстом после ошибки с фото")
                 return True
             except Exception as e2:
-                print(f"   ❌ Не удалось и текстом: {e2}")
+                print(f"   ❌ Не удалось: {e2}")
         return False
 
 async def main():
-    print("🚀 Запуск футбольного бота (скачивание картинок, сохранение URL)")
+    print("🚀 Запуск футбольного бота (приоритет топ-клубов и трансферов)")
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    
+
     sent_urls = load_sent_urls()
     print(f"Загружено {len(sent_urls)} ранее отправленных URL")
-    
+
     all_news = []
     for feed_url in RSS_FEEDS:
         print(f"📡 RSS: {feed_url}")
@@ -299,17 +335,29 @@ async def main():
                 continue
             if not is_recent(pub_date):
                 continue
-            all_news.append((title, link, desc, rss_image, pub_date))
+            priority = compute_priority(title, desc)
+            all_news.append({
+                'title': title,
+                'url': link,
+                'description': desc,
+                'image': rss_image,
+                'pub_date': pub_date,
+                'priority': priority
+            })
+
     if not all_news:
         print("Нет новых футбольных новостей.")
         return
-    all_news.sort(key=lambda x: parse_rss_date(x[4]) or datetime.min, reverse=True)
+
+    # Сортировка: сначала высокий приоритет, затем по дате (новые сверху)
+    all_news.sort(key=lambda x: (-x['priority'], parse_rss_date(x['pub_date']) or datetime.min), reverse=False)
+
     to_send = all_news[:MAX_ARTICLES_PER_RUN]
     print(f"Отправляю {len(to_send)} новостей...")
-    for title, link, desc, rss_image, _ in to_send:
-        success = await send_article(bot, title, link, desc, rss_image)
+    for item in to_send:
+        success = await send_article(bot, item['title'], item['url'], item['description'], item['image'])
         if success:
-            sent_urls.add(link)
+            sent_urls.add(item['url'])
     save_sent_urls(sent_urls)
     print(f"✨ Готово. Отправлено {len(to_send)}. Всего сохранено URL: {len(sent_urls)}")
 
