@@ -1,9 +1,7 @@
-name: Football News Bot (30 min)
+name: Football News Bot
 
 on:
-  schedule:
-    - cron: '*/30 * * * *'   # каждые 30 минут
-  workflow_dispatch:
+  workflow_dispatch:    # <-- Бот будет запускаться только по команде извне
 
 jobs:
   run-bot:
