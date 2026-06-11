@@ -4,31 +4,34 @@ import re
 import xml.etree.ElementTree as ET
 import requests
 import io
-import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin
 from dotenv import load_dotenv
 from telegram import Bot, InputFile
 from telegram.constants import ParseMode
+import google.generativeai as genai
 
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OPENROUTER_API_KEY]):
+if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GEMINI_API_KEY]):
     print("❌ Не хватает переменных окружения")
     exit(1)
 
+# Настройка Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')  # быстрая бесплатная модель
+
 # ================== НАСТРОЙКИ ==================
 MAX_NEWS_TO_COLLECT = 60
-MAX_NEWS_TO_EVALUATE = 12          # не более 12 для оценки (лимит 20 в минуту)
+MAX_NEWS_TO_EVALUATE = 10          # можно спокойно оценивать 10, лимит Gemini высокий
 FINAL_POSTS_COUNT = 3
 RSS_TIMEOUT = 12
 PAGE_TIMEOUT = 12
-REQUEST_DELAY = 3                   # пауза между LLM-запросами (сек)
+REQUEST_DELAY = 1                   # пауза между запросами (сек)
 
-# RSS-источники (только футбольные, без другого спорта)
 RSS_FEEDS = [
     "http://feeds.bbci.co.uk/sport/football/rss.xml",
     "https://www.espn.com/espn/rss/soccer/news",
@@ -38,7 +41,6 @@ RSS_FEEDS = [
     "https://www.sports.ru/rss/",
 ]
 
-# Белый список ключевых слов (футбол)
 FOOTBALL_KEYWORDS = [
     "football", "soccer", "transfer", "contract", "injury", "manager", "fifa",
     "real madrid", "barcelona", "bayern", "psg", "man city", "liverpool",
@@ -104,7 +106,7 @@ def fetch_page_image_and_text(url: str):
                 texts.append(text)
             if len(texts) >= 8:
                 break
-        full_text = " ".join(texts[:4])  # первые 4 абзаца
+        full_text = " ".join(texts[:4])
         if len(full_text) > 1500:
             full_text = full_text[:1500]
         return image, full_text
@@ -122,31 +124,19 @@ def download_image(image_url: str):
     except Exception:
         return None
 
-def call_llm(prompt: str, max_tokens: int = 250) -> str | None:
-    """Вызов LLM через OpenRouter с обработкой лимитов"""
-    model = "nvidia/nemotron-3.5-content-safety:free"   # стабильная бесплатная модель
+def call_gemini(prompt: str, max_tokens: int = 250) -> str | None:
+    """Вызов Gemini 1.5 Flash (бесплатно, 60 запросов в минуту)"""
     try:
-        resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": max_tokens
-            },
-            timeout=30
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.3,
+                max_output_tokens=max_tokens
+            )
         )
-        if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"].strip()
-        else:
-            print(f"LLM ошибка {resp.status_code}: {resp.text[:100]}")
-            return None
+        return response.text.strip()
     except Exception as e:
-        print(f"LLM исключение: {e}")
+        print(f"Gemini ошибка: {e}")
         return None
 
 def rate_article(title: str, description: str) -> int:
@@ -159,13 +149,13 @@ Return only a single number, nothing else.
 
 Headline: {title}
 Description: {description[:300]}"""
-    result = call_llm(prompt, max_tokens=10)
+    result = call_gemini(prompt, max_tokens=10)
     if result and result.isdigit():
         return int(result)
     return 5
 
 def generate_post(title: str, content: str) -> str:
-    prompt = f"""Write a short, engaging Telegram post (max 800 characters) based on this football news. 
+    prompt = f"""Write a short, engaging Telegram post (max 700 characters) based on this football news. 
 Use emojis moderately. The post should be punchy, easy to read, and end with a question: "👇 Your opinion?"
 Do not mention sources like BBC, ESPN, etc. Write in English.
 
@@ -173,11 +163,11 @@ Headline: {title}
 Content: {content[:800]}
 
 Telegram post:"""
-    post = call_llm(prompt, max_tokens=500)
+    post = call_gemini(prompt, max_tokens=500)
     if not post or len(post) < 20:
         post = f"⚽ {title}\n\n👇 Your opinion?"
-    if len(post) > 800:
-        post = post[:800]
+    if len(post) > 700:
+        post = post[:700]
     return post
 
 async def send_post(bot, title, url, description, rss_image):
@@ -207,10 +197,9 @@ async def send_post(bot, title, url, description, rss_image):
             return False
 
 async def main():
-    print("🚀 Редакторский бот (фильтр по ключевым словам + LLM оценка без rate limit)")
+    print("🚀 Редакторский бот (Google Gemini — бесплатно, без лимитов OpenRouter)")
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-    # Сбор новостей
     raw_news = []
     for feed in RSS_FEEDS:
         print(f"📡 RSS: {feed}")
@@ -225,9 +214,8 @@ async def main():
     if not raw_news:
         return
 
-    # Убираем дубли по заголовкам (простейший способ)
-    unique = []
     seen = set()
+    unique = []
     for title, link, desc, pub_date, img in raw_news:
         key = title.lower()[:50]
         if key not in seen:
@@ -235,9 +223,8 @@ async def main():
             unique.append((title, link, desc, pub_date, img))
     print(f"Уникальных: {len(unique)}")
 
-    # Берём только первые MAX_NEWS_TO_EVALUATE (чтобы не превысить лимит)
     candidates = unique[:MAX_NEWS_TO_EVALUATE]
-    print(f"Оцениваем {len(candidates)} новостей (с паузой {REQUEST_DELAY} сек между запросами)")
+    print(f"Оцениваем {len(candidates)} новостей (пауза {REQUEST_DELAY} сек)")
 
     rated = []
     for idx, (title, link, desc, pub_date, img) in enumerate(candidates):
@@ -247,7 +234,6 @@ async def main():
         if idx < len(candidates) - 1:
             await asyncio.sleep(REQUEST_DELAY)
 
-    # Сортируем по убыванию оценки
     rated.sort(key=lambda x: x[0], reverse=True)
     top = [item for item in rated if item[0] >= 7][:FINAL_POSTS_COUNT]
     if not top:
