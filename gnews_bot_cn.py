@@ -22,7 +22,7 @@ if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GEMINI_API_KEY]):
 
 # Настройка Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')  # быстрая бесплатная модель
+model = genai.GenerativeModel('gen-lang-client-0996570350')  # быстрая бесплатная модель
 
 # ================== НАСТРОЙКИ ==================
 MAX_NEWS_TO_COLLECT = 60
