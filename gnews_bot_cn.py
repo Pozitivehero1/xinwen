@@ -153,7 +153,7 @@ def download_image(image_url: str):
 def call_llm(prompt: str, max_tokens: int = 300) -> str | None:
     """Вызов бесплатной модели OpenRouter (Nemotron 3 Ultra или Gemma 4)"""
     # Можно выбрать любую из бесплатных. Я ставлю Nemotron 3 Ultra — она мощная.
-    model = "nvidia/nemotron-3-ultra-550b-a55b:free"   # абсолютно бесплатно
+    model = "google/gemma-4-31b-it:free"   # абсолютно бесплатно
     # Альтернативы: "google/gemma-4-31b:free", "meta-llama/llama-3.3-70b-instruct:free", "qwen/qwen3-next-80b-a3b:free"
     try:
         resp = requests.post(
