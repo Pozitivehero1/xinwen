@@ -1,7 +1,9 @@
-name: Football News Bot
+name: Editor Bot (every 2h)
 
 on:
-  workflow_dispatch:    # <-- Бот будет запускаться только по команде извне
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -20,12 +22,5 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: python gnews_bot_cn.py
-      - name: Commit sent URLs
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add sent_urls.txt
-          git diff --staged --quiet || git commit -m "Update sent URLs [skip ci]"
-          git push
