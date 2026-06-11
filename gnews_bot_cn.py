@@ -124,7 +124,7 @@ def download_image(image_url: str):
 
 def call_llm(prompt: str, max_tokens: int = 250) -> str | None:
     """Вызов LLM через OpenRouter с обработкой лимитов"""
-    model = "google/gemma-4-31b:free"   # стабильная бесплатная модель
+    model = "nvidia/nemotron-3-ultra-550b-a55b:free"   # стабильная бесплатная модель
     try:
         resp = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
